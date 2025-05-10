@@ -75,13 +75,25 @@ def process_segments(model, segments, sr, config, device, lang_id=None):
         lang2id = load_langs(os.path.join(config["output"]["save_dir"], "langs.txt"))
 
         if lang_id is not None:
+            # Check for OOR
+            try:
+              for lid in lang2id.values():
+                if lang_id <= lid:
+                  pass
+                else:
+                  raise ValueError(f"Error: Language ID ({lang_id}) is higher than the latest ID ({lid}) of this model.\n Languages and Codes available: {lang2id}")
+                  break
+            except ValueError as e:
+              print(e)
+              sys.exit(0)
+
             lang_tensor = torch.tensor([lang_id], dtype=torch.long).to(device)
             output = model(input_values, lang_tensor)
             logits, offsets = output if isinstance(output, tuple) else (output, None)
             logits_list.append(logits)
             if offsets is not None:
                 offsets_list.append(offsets)
-        else:
+        else:            
             for lid in lang2id.values():
                 lang_tensor = torch.tensor([lid], dtype=torch.long).to(device)
                 output = model(input_values, lang_tensor)
@@ -142,13 +154,25 @@ def infer_audio(audio_path, config_path="config.yaml", checkpoint_path="best_mod
         offsets_list = []
 
         if lang_id is not None:
+            # Check for OOR
+            try:
+              for lid in lang2id.values():
+                if lang_id <= lid:
+                  pass
+                else:
+                  raise ValueError(f"Error: Language ID ({lang_id}) is higher than the latest ID ({lid}) of this model.\n Languages and Codes available: {lang2id}")
+                  break
+            except ValueError as e:
+              print(e)
+              sys.exit(0)
+            
             lt = torch.tensor([lang_id], dtype=torch.long).to(device)
             out = model(inp, lt)
             logits, offsets = out if isinstance(out, tuple) else (out, None)
             logits_list.append(logits)
             if offsets is not None:
                 offsets_list.append(offsets)
-        else:
+        else:            
             for lid in lang2id.values():
                 lt = torch.tensor([lid], dtype=torch.long).to(device)
                 out = model(inp, lt)
@@ -217,7 +241,7 @@ if __name__ == "__main__":
     @click.option('--checkpoint', '-ckpt', type=str, required=True, help='Path to WFL Checkpoint.')
     @click.option('--config', '-c', type=str, required=True, help='Path to Config file.')
     @click.option('--output', '-o', type=str, required=False, default=".", help='Path to output labels.')
-    @click.option('--lang-id', '-l', type=int, required=False, default=-1, help='Language ID.')
+    @click.option('--lang-id', '-l', type=int, required=False, default=None, help='Language ID.')
     def main(path, checkpoint, config, output, lang_id) -> None:
         device = "cuda:0" if torch.cuda.is_available() else "cpu"
         folder = False
@@ -226,16 +250,15 @@ if __name__ == "__main__":
         config_path = Path(config)
         if output == ".":
             output_path = inf_path
+        else:
+            output_path = output
         if not inf_path.exists():
             print(f"Unable to locate folder {str(inf_path)}")
             sys.exit(1)
         if inf_path.is_dir():
             folder = True
-
-        if lang_id != -1:
-            lang_id += 1
-        else:
-            lang_id = 0
+        if lang_id <= -1:
+          lang_id = None
 
         if folder:
             infer_folder(
@@ -248,10 +271,10 @@ if __name__ == "__main__":
             )
         else:
             segments = infer_audio(
-                folder_path=str(inf_path),
+                audio_path=str(inf_path),
                 config_path=str(config_path),
                 checkpoint_path=str(checkpoint_path),
-                output_dir=str(output_path),
+                output_lab_path=str(output_path),
                 device=device,
                 lang_id=lang_id
             )
