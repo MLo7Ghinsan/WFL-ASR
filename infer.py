@@ -261,7 +261,7 @@ def process_audio(
 @click.option("--min-silence-duration", default=0.5, type=float, help="Minimum duration (seconds) required to trigger hard silence")
 def main(input_path, checkpoint, config, lang_id, no_use_offset, silence_phoneme, silence_threshold, min_silence_duration):
     cfg = load_config(config)
-    device = "cuda" if torch.cuda.is_available() else "mps" if torch.mps.is_available else "cpu"
+    device = "cuda" if torch.cuda.is_available() else "mps" if torch.mps.is_available() else "cpu"
     print(f"Running on: {device}")
 
     save_dir = cfg["output"]["save_dir"]
