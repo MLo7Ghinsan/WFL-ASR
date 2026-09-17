@@ -1,22 +1,26 @@
 import os
-import torch
-import yaml
+
 import click
-import soundfile as sf
-import torchaudio
 import numpy as np
+import soundfile as sf
+import torch
+import torchaudio
+import yaml
+from librosa.sequence import _viterbi, viterbi
+from librosa.util import tiny
+from numba.cuda.stubs import const
 
 from model import BIOPhonemeTagger
 from utils import (
-    decode_bio_tags,
-    save_lab,
-    load_phoneme_list,
-    load_langs,
-    load_phoneme_merge_map,
     canonical_to_lang,
-    load_phones_txt,
+    decode_bio_tags,
     forced_align_bio,
+    load_langs,
+    load_phoneme_list,
+    load_phoneme_merge_map,
+    load_phones_txt,
     merge_adjacent_segments,
+    save_lab,
 )
 
 
@@ -72,6 +76,53 @@ def constrained_decode(logits, id2label):
     return preds
 
 
+def viterbi_decode(logits, id2label: dict[int, str], viterbi_bias=1):
+    num_states = len(id2label)
+    probs = torch.log_softmax(logits, dim=-1).cpu().numpy().transpose()
+
+    # prepare probability stuff
+    trans_mat = np.ones((num_states, num_states))
+    init_prob = np.ones(num_states) / num_states
+
+    for i in range(num_states):
+        curr = id2label[i]
+        if curr == "O":  # O can transition to anything. SKIP
+            continue
+        for j in range(num_states):
+            curr_phn = curr[2:]
+            next = id2label[j]
+            next_phn = next[2:]
+            if next == "O":  # disallow O transitions
+                trans_mat[i, j] = 0
+                continue
+            if curr.startswith("B-"):
+                if next.startswith("I-") and curr_phn == next_phn:
+                    # encourage B-a -> I-a
+                    trans_mat[i, j] = viterbi_bias
+                elif next.startswith("B-") and curr_phn == next_phn:
+                    # disallow B-a -> B-a
+                    trans_mat[i, j] = 0
+            else:
+                if next.startswith("I-"):
+                    # encourage I-a -> I-a, disallow I-a -> I-b
+                    trans_mat[i, j] = viterbi_bias if curr_phn == next_phn else 0
+                elif next.startswith("B-") and curr_phn != next_phn:
+                    # slightly encourage I-a -> B-b
+                    trans_mat[i, j] = viterbi_bias / 2
+
+    # normalize
+    trans_mat /= np.sum(trans_mat, axis=1, keepdims=True)
+
+    # convert to log-probs
+    eps = tiny(trans_mat)
+    trans_mat = np.log(trans_mat + eps)
+    init_prob = np.log(init_prob + eps)
+
+    preds, _ = _viterbi(probs.transpose(), trans_mat, init_prob)
+    preds = [id2label[i] for i in preds]
+    return preds
+
+
 def apply_hard_silence(segments, audio, sr, threshold, min_duration, silence_phoneme):
     if len(audio) == 0:
         return segments
@@ -111,7 +162,7 @@ def apply_hard_silence(segments, audio, sr, threshold, min_duration, silence_pho
         return segments
 
     temp_segments = segments.copy()
-    
+
     for sil_start, sil_end in silence_intervals:
         next_temp_segments = []
         for s_start, s_end, s_label in temp_segments:
@@ -144,11 +195,13 @@ def process_audio(
     lang_name=None,
     phones=None,
     no_use_offset=False,
+    decoder="constrained",
+    viterbi_bias=5,
 ):
     original_duration = len(audio) / sr
     pad_sec = 0.5
     pad_samples = int(pad_sec * sr)
-    audio = np.pad(audio, (0, pad_samples), mode='constant')
+    audio = np.pad(audio, (0, pad_samples), mode="constant")
 
     audio = audio / (np.max(np.abs(audio)) + 1e-8)
     total_len = len(audio)
@@ -172,7 +225,7 @@ def process_audio(
             if len(chunk) == 0:
                 continue
             pad_res = 1600 - len(chunk)
-            chunk = np.pad(chunk, (0, pad_res), mode='constant')
+            chunk = np.pad(chunk, (0, pad_res), mode="constant")
 
         input_values = torch.tensor(chunk, dtype=torch.float32).unsqueeze(0).to(device)
 
@@ -204,9 +257,16 @@ def process_audio(
     if phones:
         pred_tags = forced_align_bio(full_logits, model.id2label, phones)
     else:
-        pred_tags = constrained_decode(full_logits, model.id2label)
+        if decoder == "constrained":
+            pred_tags = constrained_decode(full_logits, model.id2label)
+        elif decoder == "viterbi":
+            pred_tags = viterbi_decode(
+                full_logits, model.id2label, viterbi_bias=viterbi_bias
+            )
 
-    segments = decode_bio_tags(pred_tags, config["data"]["frame_duration"], full_offsets)
+    segments = decode_bio_tags(
+        pred_tags, config["data"]["frame_duration"], full_offsets
+    )
 
     all_segments = []
     for s, e, ph in segments:
@@ -218,10 +278,10 @@ def process_audio(
     for s, e, ph in all_segments:
         if s >= original_duration:
             continue
-        
+
         if e > original_duration:
             e = original_duration
-        
+
         valid_segments.append((s, e, ph))
 
     if not valid_segments:
@@ -250,18 +310,88 @@ def process_audio(
 
 
 @click.command()
-@click.option("--input", "-i", "input_path", default="infer_test", help="Path to a .wav file or folder containing .wav files")
-@click.option("--checkpoint", "-ckpt", default="checkpoints_no_env/model.ckpt", help="Path to WFL .ckpt file")
-@click.option("--config", "-c", default="checkpoints_no_env/config.yaml", help="Path to config file")
-@click.option("--lang-id", "-l", type=int, default=None, help="Language ID (int) used during training. Example: `-l 0`")
-@click.option("--no_use_offset", is_flag=True, help="Disable offset head refinement (offsets ON by default).")
+@click.option(
+    "--input",
+    "-i",
+    "input_path",
+    default="infer_test",
+    help="Path to a .wav file or folder containing .wav files",
+)
+@click.option(
+    "--checkpoint",
+    "-ckpt",
+    default="checkpoints_no_env/model.ckpt",
+    help="Path to WFL .ckpt file",
+)
+@click.option(
+    "--config",
+    "-c",
+    default="checkpoints_no_env/config.yaml",
+    help="Path to config file",
+)
+@click.option(
+    "--lang-id",
+    "-l",
+    type=int,
+    default=None,
+    help="Language ID (int) used during training. Example: `-l 0`",
+)
+@click.option(
+    "--no_use_offset",
+    is_flag=True,
+    help="Disable offset head refinement (offsets ON by default).",
+)
 # long silence stuff
-@click.option("--silence-phoneme", default="SP", help="The phoneme label to use for hard-coded silence (default: SP)")
-@click.option("--silence-threshold", default=0.005, type=float, help="Amplitude threshold (0.0-1.0) to consider as silence")
-@click.option("--min-silence-duration", default=0.5, type=float, help="Minimum duration (seconds) required to trigger hard silence")
-def main(input_path, checkpoint, config, lang_id, no_use_offset, silence_phoneme, silence_threshold, min_silence_duration):
+@click.option(
+    "--silence-phoneme",
+    default="SP",
+    help="The phoneme label to use for hard-coded silence (default: SP)",
+)
+@click.option(
+    "--silence-threshold",
+    default=0.005,
+    type=float,
+    help="Amplitude threshold (0.0-1.0) to consider as silence",
+)
+@click.option(
+    "--min-silence-duration",
+    default=0.5,
+    type=float,
+    help="Minimum duration (seconds) required to trigger hard silence",
+)
+@click.option(
+    "--decoder-type",
+    "-d",
+    default="viterbi",
+    type=str,
+    help="Decoder type for no transcription inference [constrained|viterbi] (default: viterbi)",
+)
+@click.option(
+    "--viterbi-bias",
+    default=5,
+    type=float,
+    help="Amount of bias (>=1) added to frames of the same phoneme for viterbi decoding. (default: 5)",
+)
+def main(
+    input_path,
+    checkpoint,
+    config,
+    lang_id,
+    no_use_offset,
+    silence_phoneme,
+    silence_threshold,
+    min_silence_duration,
+    decoder_type,
+    viterbi_bias,
+):
     cfg = load_config(config)
-    device = "cuda" if torch.cuda.is_available() else "mps" if torch.mps.is_available() else "cpu"
+    device = (
+        "cuda"
+        if torch.cuda.is_available()
+        else "mps"
+        if torch.mps.is_available()
+        else "cpu"
+    )
     print(f"Running on: {device}")
 
     save_dir = cfg["output"]["save_dir"]
@@ -289,7 +419,11 @@ def main(input_path, checkpoint, config, lang_id, no_use_offset, silence_phoneme
 
     # weights_only=False because I dont like the the 'untrusted-models' warning
     checkpoint_data = torch.load(checkpoint, map_location=device, weights_only=False)
-    state_dict = checkpoint_data["state_dict"] if "state_dict" in checkpoint_data else checkpoint_data
+    state_dict = (
+        checkpoint_data["state_dict"]
+        if "state_dict" in checkpoint_data
+        else checkpoint_data
+    )
 
     new_state_dict = {}
     for k, v in state_dict.items():
@@ -315,7 +449,9 @@ def main(input_path, checkpoint, config, lang_id, no_use_offset, silence_phoneme
             try:
                 phones = load_phones_txt(txt_path)
                 if phones:
-                    print(f"  Forced-align enabled (found: {os.path.basename(txt_path)})")
+                    print(
+                        f"  Forced-align enabled (found: {os.path.basename(txt_path)})"
+                    )
                 else:
                     phones = None
             except Exception as e:
@@ -332,7 +468,9 @@ def main(input_path, checkpoint, config, lang_id, no_use_offset, silence_phoneme
             audio_t = torch.tensor(audio, dtype=torch.float32)
             if audio_t.dim() > 1:
                 audio_t = audio_t.mean(dim=1)
-            audio = torchaudio.functional.resample(audio_t, sr, cfg["data"]["sample_rate"]).numpy()
+            audio = torchaudio.functional.resample(
+                audio_t, sr, cfg["data"]["sample_rate"]
+            ).numpy()
             sr = cfg["data"]["sample_rate"]
 
         segments = process_audio(
@@ -346,10 +484,14 @@ def main(input_path, checkpoint, config, lang_id, no_use_offset, silence_phoneme
             lang_name=lang_name,
             phones=phones,
             no_use_offset=no_use_offset,
+            decoder=decoder_type,
+            viterbi_bias=viterbi_bias,
         )
 
         if cfg.get("postprocess", {}).get("merge_segments", "right") != "none":
-            segments = merge_adjacent_segments(segments, cfg["postprocess"]["merge_segments"])
+            segments = merge_adjacent_segments(
+                segments, cfg["postprocess"]["merge_segments"]
+            )
 
         # Apply hard silence ONLY if we are NOT using forced alignment
         # Forced alignment already knows where silence is based on the text "SP" tag if its in the txt
@@ -361,7 +503,7 @@ def main(input_path, checkpoint, config, lang_id, no_use_offset, silence_phoneme
                 sr,
                 threshold=silence_threshold,
                 min_duration=min_silence_duration,
-                silence_phoneme=silence_phoneme
+                silence_phoneme=silence_phoneme,
             )
 
         out_path = wav_path.replace(".wav", ".lab")
