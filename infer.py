@@ -6,6 +6,7 @@ import soundfile as sf
 import torch
 import torchaudio
 import yaml
+import math
 from librosa.sequence import _viterbi, viterbi
 from librosa.util import tiny
 from numba.cuda.stubs import const
@@ -198,10 +199,9 @@ def process_audio(
     decoder="constrained",
     viterbi_bias=5,
 ):
+    if len(audio) == 0:
+        return []
     original_duration = len(audio) / sr
-    pad_sec = 0.5
-    pad_samples = int(pad_sec * sr)
-    audio = np.pad(audio, (0, pad_samples), mode="constant")
 
     audio = audio / (np.max(np.abs(audio)) + 1e-8)
     total_len = len(audio)
@@ -227,26 +227,20 @@ def process_audio(
             pad_res = 1600 - len(chunk)
             chunk = np.pad(chunk, (0, pad_res), mode="constant")
 
+        expected_frames = math.ceil(
+            (end - start) / sr / config["data"]["frame_duration"]
+        )
         input_values = torch.tensor(chunk, dtype=torch.float32).unsqueeze(0).to(device)
+        lengths = torch.tensor([expected_frames], device=device)
 
         with torch.no_grad():
-            logits, offsets, _ = model(input_values, lang_tensor)
+            logits, offsets, _ = model(
+                input_values, lang_tensor, lengths=lengths
+            )
 
-            logits = logits.squeeze(0).cpu()
-            if offsets is not None:
-                offsets = offsets.squeeze(0).cpu()
-
-            frame_dur = config["data"]["frame_duration"]
-            expected_frames = int(len(audio[start:end]) / sr / frame_dur)
-
-            if logits.size(0) > expected_frames:
-                logits = logits[:expected_frames]
-                if offsets is not None:
-                    offsets = offsets[:expected_frames]
-
-            accumulated_logits.append(logits)
-            if offsets is not None:
-                accumulated_offsets.append(offsets)
+        accumulated_logits.append(logits.squeeze(0).cpu())
+        if offsets is not None:
+            accumulated_offsets.append(offsets.squeeze(0).cpu())
 
     full_logits = torch.cat(accumulated_logits, dim=0)
 
