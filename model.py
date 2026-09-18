@@ -48,14 +48,46 @@ class FocalLoss(nn.Module):
 class SpecAugment(nn.Module):
     def __init__(self, freq_mask_param=20, time_mask_param=30):
         super().__init__()
-        self.freq_mask = torchaudio.transforms.FrequencyMasking(freq_mask_param)
-        self.time_mask = torchaudio.transforms.TimeMasking(time_mask_param)
+        self.freq_mask_param = freq_mask_param
+        self.time_mask_param = time_mask_param
 
-    def forward(self, x):
-        x = x.transpose(1, 2)
-        x = self.freq_mask(x)
-        x = self.time_mask(x)
-        return x.transpose(1, 2)
+    def forward(self, x, lengths):
+        if not self.training:
+            return x
+
+        batch, frames, channels = x.shape
+        lengths = lengths.to(device=x.device, dtype=torch.long)
+        time_limit = (lengths // 5).clamp(max=self.time_mask_param)
+        time_width = (torch.rand(batch, device=x.device) * (time_limit + 1)).long()
+        time_start = (
+            torch.rand(batch, device=x.device) * (lengths - time_width + 1)
+        ).long()
+
+        feature_limit = min(self.freq_mask_param, channels - 1)
+        feature_width = torch.randint(
+            feature_limit + 1, (batch,), device=x.device
+        )
+        feature_start = (
+            torch.rand(batch, device=x.device) * (channels - feature_width + 1)
+        ).long()
+
+        t = torch.arange(frames, device=x.device)[None, :]
+        c = torch.arange(channels, device=x.device)[None, :]
+        time_mask = (t >= time_start[:, None]) & (
+            t < (time_start + time_width)[:, None]
+        )
+        feature_mask = (c >= feature_start[:, None]) & (
+            c < (feature_start + feature_width)[:, None]
+        )
+        mask = torch.logical_or(
+            time_mask[:, :, None],
+            feature_mask[:, None, :],
+        )
+        mask = torch.logical_or(
+            mask,
+            (t >= lengths[:, None])[:, :, None],
+        )
+        return x.masked_fill(mask, 0)
 
 class FeedForwardModule(nn.Module):
     def __init__(self, dim, expansion=4, dropout=0.1):
@@ -229,10 +261,10 @@ class BIOPhonemeTagger(nn.Module):
         if max_len > hidden_states.size(1):
             raise ValueError("Labels exceed encoder output. Split long audio first.")
 
-        if self.training:
-            hidden_states = self.spec_aug(hidden_states)
-
         hidden_states = hidden_states[:, :max_len]
+        if self.training:
+            hidden_states = self.spec_aug(hidden_states, lengths)
+            
         valid = torch.arange(max_len, device=input_values.device)[None, :] < lengths[:, None]
         mask = valid.unsqueeze(-1)
 
