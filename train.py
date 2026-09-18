@@ -374,11 +374,12 @@ def main():
 
     checkpoint_callback = ModelCheckpoint(
         dirpath=save_dir,
-        filename="model-ep{epoch:02d}-val_loss{val/loss:.4f}",
+        filename="model-ep{epoch:02d}-{val/loss:.4f}",
+        auto_insert_metric_name=False,
         monitor="val/loss",
         mode="min",
         save_top_k=config["training"]["max_checkpoints"],
-        save_last=True
+        save_last=True,
     )
     
     lr_monitor = LearningRateMonitor(logging_interval='epoch')
