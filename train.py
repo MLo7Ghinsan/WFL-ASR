@@ -149,83 +149,50 @@ class WFLModel(pl.LightningModule):
         
         total_val = config["data"]["num_val_files"]
         self.num_vis_samples = min(total_val, 8) 
-        
-        # MFCC
-        self.envelope_loss_weight = config["model"].get("envelope_loss_weight", 0.5)
-        hop_length = int(config["data"]["sample_rate"] * self.frame_duration)
-        n_mfcc = config["model"].get("envelope_dim", 20)
-        
-        self.envelope_extractor = torchaudio.transforms.MFCC(
-            sample_rate=config["data"]["sample_rate"],
-            n_mfcc=n_mfcc,
-            melkwargs={
-                "n_fft": 400,
-                "hop_length": hop_length,
-                "n_mels": 80,
-                "mel_scale": "htk",
-            }
-        )
 
     def forward(self, x, lang_ids, lengths):
         return self.model(x, lang_ids, lengths=lengths)
 
-    def calculate_loss(self, logits, offsets, pred_env, target_env, labels, segs_gt, lengths):
-        cls_loss = self.criterion(logits.reshape(-1, logits.size(-1)), labels.reshape(-1))
-        
+    def calculate_loss(self, logits, offsets, labels, segs_gt, lengths):
+        cls_loss = self.criterion(
+            logits.reshape(-1, logits.size(-1)), labels.reshape(-1)
+        )
+
         total_offset_loss = torch.tensor(0.0, device=self.device)
         if offsets is not None:
-            target_map = torch.zeros_like(offsets) 
-            mask_map = torch.zeros_like(offsets)   
-            
+            target_map = torch.zeros_like(offsets)
+            mask_map = torch.zeros_like(offsets)
+
             for b_idx in range(len(segs_gt)):
                 for start_t, end_t, _ in segs_gt[b_idx]:
                     s_f = int(start_t / self.frame_duration)
                     e_f = int(end_t / self.frame_duration)
-                    
+
                     if s_f < lengths[b_idx]:
-                        target_map[b_idx, s_f, 0] = (start_t / self.frame_duration) - s_f
+                        target_map[b_idx, s_f, 0] = start_t / self.frame_duration - s_f
                         mask_map[b_idx, s_f, 0] = 1.0
                     if e_f < lengths[b_idx]:
-                        target_map[b_idx, e_f, 1] = (end_t / self.frame_duration) - e_f
+                        target_map[b_idx, e_f, 1] = end_t / self.frame_duration - e_f
                         mask_map[b_idx, e_f, 1] = 1.0
-            
+
             diff = torch.abs(offsets - target_map) * mask_map
-            total_offset_loss = (diff.sum() / (mask_map.sum() + 1e-8)) * self.offset_weight
+            total_offset_loss = (
+                diff.sum() / (mask_map.sum() + 1e-8)
+            ) * self.offset_weight
 
-        # env l1
-        env_loss = torch.tensor(0.0, device=self.device)
-        if target_env is not None and pred_env is not None:
-            mask = (labels != -100).unsqueeze(-1).expand_as(pred_env)
-            min_len = min(pred_env.size(1), target_env.size(1))
-            
-            p_env = pred_env[:, :min_len, :] * mask[:, :min_len, :]
-            t_env = target_env[:, :min_len, :] * mask[:, :min_len, :]
-            
-            env_loss = torch.nn.functional.l1_loss(p_env, t_env, reduction='sum') / (mask.sum() + 1e-8)
-            env_loss = env_loss * self.envelope_loss_weight
-
-        total_loss = cls_loss + total_offset_loss + env_loss
-        return total_loss, cls_loss, total_offset_loss, env_loss
+        total_loss = cls_loss + total_offset_loss
+        return total_loss, cls_loss, total_offset_loss
 
     def training_step(self, batch, batch_idx):
         inputs, labels, wavs, segs_gt, _, langs, lengths = batch
-        
-        wav_tensor = torch.nn.utils.rnn.pad_sequence(
-            [torch.tensor(w, dtype=torch.float32) for w in wavs], batch_first=True
-        ).to(self.device)
-        
-        with torch.no_grad():
-            target_env = self.envelope_extractor(wav_tensor).transpose(1, 2)
-
-        logits, offsets, pred_env = self(inputs, langs, lengths)
-        loss, cls_loss, off_loss, env_loss = self.calculate_loss(
-            logits, offsets, pred_env, target_env, labels, segs_gt, lengths
+        logits, offsets = self(inputs, langs, lengths)
+        loss, cls_loss, off_loss = self.calculate_loss(
+            logits, offsets, labels, segs_gt, lengths
         )
-        
+
         self.log("train/loss", loss, on_step=True, on_epoch=True, prog_bar=True, batch_size=inputs.size(0))
         self.log("train/cls_loss", cls_loss, on_step=False, on_epoch=True, batch_size=inputs.size(0))
         self.log("train/off_loss", off_loss, on_step=False, on_epoch=True, batch_size=inputs.size(0))
-        self.log("train/env_loss", env_loss, on_step=False, on_epoch=True, batch_size=inputs.size(0))
         return loss
 
     def on_validation_epoch_start(self):
@@ -233,27 +200,24 @@ class WFLModel(pl.LightningModule):
 
     def validation_step(self, batch, batch_idx):
         inputs, labels, wavs, segs_gt, _, langs, lengths = batch
-        
-        wav_tensor = torch.nn.utils.rnn.pad_sequence(
-            [torch.tensor(w, dtype=torch.float32) for w in wavs], batch_first=True
-        ).to(self.device)
-        
-        with torch.no_grad():
-            target_env = self.envelope_extractor(wav_tensor).transpose(1, 2)
+        logits, offsets = self(inputs, langs, lengths)
+        loss, _, _ = self.calculate_loss(
+            logits, offsets, labels, segs_gt, lengths
+        )
 
-        logits, offsets, pred_env = self(inputs, langs, lengths)
-        loss, _, _, _ = self.calculate_loss(logits, offsets, pred_env, target_env, labels, segs_gt, lengths)
-        
         preds = torch.argmax(logits, dim=-1)
         mask = labels != -100
         acc = (preds == labels)[mask].float().mean() * 100.0
-        
+
         self.log("val/loss", loss, on_step=False, on_epoch=True, prog_bar=True, batch_size=inputs.size(0))
         self.log("val/acc", acc, on_step=False, on_epoch=True, prog_bar=True, batch_size=inputs.size(0))
 
         for i in range(len(wavs)):
             if self.val_vis_count < self.num_vis_samples:
-                self._log_visualization(wavs[i], preds[i], lengths[i], offsets[i], segs_gt[i], sample_idx=self.val_vis_count)
+                self._log_visualization(
+                    wavs[i], preds[i], lengths[i], offsets[i], segs_gt[i],
+                    sample_idx=self.val_vis_count,
+                )
                 self.val_vis_count += 1
 
         return loss
