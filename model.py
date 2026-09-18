@@ -39,12 +39,11 @@ class FocalLoss(nn.Module):
         self.ce = nn.CrossEntropyLoss(ignore_index=ignore_index, reduction='none')
 
     def forward(self, logits, targets):
-        logits = logits.float()
-        log_pt = -self.ce(logits, targets)
-        pt = torch.exp(log_pt)
-        pt = torch.clamp(pt, min=1e-8, max=1.0 - 1e-8)
-        loss = self.alpha * (1 - pt) ** self.gamma * self.ce(logits, targets)
-        return loss.mean()
+        valid = targets != self.ignore_index
+        ce = self.ce(logits.float(), targets)
+        pt = torch.exp(-ce).clamp(min=1e-8, max=1.0 - 1e-8)
+        loss = self.alpha * (1 - pt) ** self.gamma * ce
+        return loss[valid].sum() / valid.sum().clamp_min(1)
 
 class SpecAugment(nn.Module):
     def __init__(self, freq_mask_param=20, time_mask_param=30):
