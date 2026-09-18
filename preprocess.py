@@ -2,6 +2,7 @@ import os
 import glob
 import json
 import yaml
+import math
 import soundfile as sf
 from tqdm import tqdm
 import argparse
@@ -9,15 +10,33 @@ import argparse
 def load_config(path="config.yaml"):
     with open(path, "r") as f: return yaml.safe_load(f)
 
-def to_bio_tags(phonemes, num_frames, frame_duration):
+def to_bio_tags(phonemes, num_frames, frame_duration, audio_duration):
+    if not phonemes or num_frames < 1:
+        raise ValueError("Empty labels or audio.")
+
     tags = ["O"] * num_frames
+    previous_end, previous_start_frame = 0.0, -1
+
     for start, end, ph in phonemes:
+        if not 0 <= start < end <= audio_duration + 1e-7:
+            raise ValueError(f"Invalid timestamps: {start} {end} {ph}")
+        if start < previous_end:
+            raise ValueError(f"Overlapping phoneme: {ph}")
+
         s_idx = int(start / frame_duration)
         e_idx = min(int(end / frame_duration), num_frames - 1)
-        if s_idx >= num_frames: continue
+
+        if s_idx >= num_frames:
+            raise ValueError(f"Phoneme starts outside the frame grid: {ph} ... EXCUSE ME HOW???\nAchievement unlocked: How Did We Get Here?")
+        if s_idx == previous_start_frame:
+            raise ValueError(f"Multiple phoneme starts in frame {s_idx}: {ph} ... EXCUSE ME HOW???\nAchievement unlocked: How Did We Get Here?")
+
         tags[s_idx] = f"B-{ph}"
         for i in range(s_idx + 1, e_idx + 1):
-            if i < num_frames: tags[i] = f"I-{ph}"
+            tags[i] = f"I-{ph}"
+
+        previous_end, previous_start_frame = end, s_idx
+
     return tags
 
 def preprocess(data_dir, config):
@@ -50,9 +69,9 @@ def preprocess(data_dir, config):
             
             # read audio
             try:
-                f = sf.SoundFile(wav)
-                dur = len(f) / f.samplerate
-                num_frames = int(dur / frame_dur)
+                with sf.SoundFile(wav) as f:
+                    dur = len(f) / f.samplerate
+                num_frames = math.ceil(dur / frame_dur)
             except Exception as e:
                 print(f"[ERROR] Could not read {wav}: {e}")
                 continue
@@ -60,9 +79,12 @@ def preprocess(data_dir, config):
             # parse Lab
             segs = []
             with open(lab, "r", encoding="utf-8") as lf:
-                for line in lf:
+                for line_number, line in enumerate(lf, 1):
                     p = line.strip().split()
-                    if len(p) != 3: continue
+                    if not p:
+                        continue
+                    if len(p) != 3:
+                        raise ValueError(f"{lab}:{line_number}: Invalid label line")
                     ph = p[2]
                     # merge
                     ph = merge_map.get(lang, {}).get(ph, ph)
@@ -70,7 +92,10 @@ def preprocess(data_dir, config):
                     phoneme_set.add(ph)
                     lang_phonemes[lang].add(ph)
             
-            tags = to_bio_tags(segs, num_frames, frame_dur)
+            try:
+                tags = to_bio_tags(segs, num_frames, frame_dur, dur)
+            except ValueError as e:
+                raise ValueError(f"{lab}: {e}") from e
             dataset.append({
                 "wav_path": wav, "bio_tags": tags, 
                 "phoneme_segments": segs, "lang_id": lang2id[lang]
