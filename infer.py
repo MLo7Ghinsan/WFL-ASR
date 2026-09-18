@@ -48,80 +48,72 @@ def find_matching_txt(wav_path):
     return txt_path if os.path.isfile(txt_path) else None
 
 
+def bio_inputs(logits, id2label):
+    labels = [id2label[i] for i in range(len(id2label))]
+    scores = logits.detach().double().cpu().numpy()
+
+    if scores.ndim != 2 or scores.shape[1] != len(labels):
+        raise ValueError("Expected logits shaped (frames, labels).")
+    if not np.isfinite(scores).all():
+        raise ValueError("Decoder received non-finite logits.")
+    if any(
+        tag != "O" and not (
+            tag.startswith(("B-", "I-")) and len(tag) > 2
+        ) for tag in labels
+    ):
+        raise ValueError("Expected O and valid B-/I- labels.")
+
+    keep = [i for i, tag in enumerate(labels) if tag != "O"]
+    scores = scores[:, keep]
+    labels = [labels[i] for i in keep]
+
+    starts = np.array([tag.startswith("B-") for tag in labels], dtype=bool)
+    if not starts.any():
+        raise ValueError("Decoder requires at least one B- label.")
+
+    allowed = np.array([
+        [
+            nxt.startswith("B-")
+            or (nxt.startswith("I-") and prev in (f"B-{nxt[2:]}", nxt))
+            for nxt in labels
+        ]
+        for prev in labels
+    ], dtype=bool)
+
+    return scores, labels, allowed, starts
+
+
 def constrained_decode(logits, id2label):
+    scores, labels, allowed, valid = bio_inputs(logits, id2label)
     preds = []
-    prev_tag = "O"
-    prev_ph = None
-    probs = torch.softmax(logits, dim=-1)
-
-    for t in range(logits.shape[0]):
-        step_probs = probs[t].clone()
-
-        for i in range(logits.shape[-1]):
-            label = id2label[i]
-            if label.startswith("I-"):
-                ph = label[2:]
-                if not (prev_ph == ph and prev_tag in [f"B-{ph}", f"I-{ph}"]):
-                    step_probs[i] = 0.0
-
-        if torch.sum(step_probs) == 0:
-            step_probs = probs[t].clone()
-
-        best_id = torch.argmax(step_probs).item()
-        best_tag = id2label[best_id]
-
-        preds.append(best_tag)
-        prev_tag = best_tag
-        prev_ph = best_tag[2:] if best_tag != "O" else None
-
+    for frame in scores:
+        best = int(np.argmax(np.where(valid, frame, -np.inf)))
+        preds.append(labels[best])
+        valid = allowed[best]
     return preds
 
 
-def viterbi_decode(logits, id2label: dict[int, str], viterbi_bias=1):
-    num_states = len(id2label)
-    probs = torch.log_softmax(logits, dim=-1).cpu().numpy().transpose()
+def viterbi_decode(logits, id2label, viterbi_bias=1):
+    if not np.isfinite(viterbi_bias) or viterbi_bias < 1:
+        raise ValueError("viterbi_bias must be finite and at least 1.")
 
-    # prepare probability stuff
-    trans_mat = np.ones((num_states, num_states))
-    init_prob = np.ones(num_states) / num_states
+    scores, labels, allowed, starts = bio_inputs(logits, id2label)
+    if scores.shape[0] == 0:
+        return []
 
-    for i in range(num_states):
-        curr = id2label[i]
-        if curr == "O":  # O can transition to anything. SKIP
-            continue
-        for j in range(num_states):
-            curr_phn = curr[2:]
-            next = id2label[j]
-            next_phn = next[2:]
-            if next == "O":  # disallow O transitions
-                trans_mat[i, j] = 0
-                continue
-            if curr.startswith("B-"):
-                if next.startswith("I-") and curr_phn == next_phn:
-                    # encourage B-a -> I-a
-                    trans_mat[i, j] = viterbi_bias
-                elif next.startswith("B-") and curr_phn == next_phn:
-                    # disallow B-a -> B-a
-                    trans_mat[i, j] = 0
-            else:
-                if next.startswith("I-"):
-                    # encourage I-a -> I-a, disallow I-a -> I-b
-                    trans_mat[i, j] = viterbi_bias if curr_phn == next_phn else 0
-                elif next.startswith("B-") and curr_phn != next_phn:
-                    # slightly encourage I-a -> B-b
-                    trans_mat[i, j] = viterbi_bias / 2
+    log_probs = scores - np.logaddexp.reduce(
+        scores, axis=1, keepdims=True
+    )
 
-    # normalize
-    trans_mat /= np.sum(trans_mat, axis=1, keepdims=True)
+    transitions = np.where(allowed, 0.0, -np.inf)
+    for j, tag in enumerate(labels):
+        if tag.startswith("I-"):
+            transitions[allowed[:, j], j] = np.log(viterbi_bias)
 
-    # convert to log-probs
-    eps = tiny(trans_mat)
-    trans_mat = np.log(trans_mat + eps)
-    init_prob = np.log(init_prob + eps)
+    initial = np.where(starts, -np.log(starts.sum()), -np.inf)
+    path, _ = _viterbi(log_probs, transitions, initial)
 
-    preds, _ = _viterbi(probs.transpose(), trans_mat, init_prob)
-    preds = [id2label[i] for i in preds]
-    return preds
+    return [labels[int(i)] for i in path]
 
 
 def apply_hard_silence(segments, audio, sr, threshold, min_duration, silence_phoneme):
