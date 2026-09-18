@@ -21,6 +21,7 @@ from torch.utils.data import Dataset, DataLoader, Subset, random_split
 from model import BIOPhonemeTagger, FocalLoss
 from utils import decode_bio_tags, visualize_prediction, load_phoneme_list
 import pytorch_optimizer as optim
+from infer import viterbi_decode, continuous_segments
 
 
 def collate_fn(batch):
@@ -226,46 +227,87 @@ class WFLModel(pl.LightningModule):
     def on_validation_epoch_start(self):
         self.val_vis_count = 0
 
+    @staticmethod
+    def _edit_distance(reference, prediction):
+        row = list(range(len(prediction) + 1))
+        for i, ref in enumerate(reference, 1):
+            next_row = [i]
+            for j, pred in enumerate(prediction, 1):
+                next_row.append(min(
+                    row[j] + 1,
+                    next_row[j - 1] + 1,
+                    row[j - 1] + (ref != pred),
+                ))
+            row = next_row
+        return row[-1]
+
     def validation_step(self, batch, batch_idx):
         inputs, labels, wavs, segs_gt, _, langs, lengths = batch
         logits, offsets = self(inputs, langs, lengths)
-        loss, _, _ = self.calculate_loss(
+        loss, cls_loss, off_loss = self.calculate_loss(
             logits, offsets, labels, segs_gt, lengths
         )
 
-        preds = torch.argmax(logits, dim=-1)
-        mask = labels != -100
-        acc = (preds == labels)[mask].float().mean() * 100.0
+        valid = labels != -100
+        frame_count = int(valid.sum().item())
+        acc = (logits.argmax(-1)[valid] == labels[valid]).float().mean() * 100
+        self.log("val/acc", acc, on_step=False, on_epoch=True,
+                 prog_bar=True, batch_size=max(frame_count, 1))
+        for name, value in (
+            ("loss", loss), ("cls_loss", cls_loss), ("off_loss", off_loss)
+        ):
+            self.log(f"val/{name}", value, on_step=False, on_epoch=True,
+                     prog_bar=name == "loss", batch_size=inputs.size(0))
 
-        self.log("val/loss", loss, on_step=False, on_epoch=True, prog_bar=True, batch_size=inputs.size(0))
-        self.log("val/acc", acc, on_step=False, on_epoch=True, prog_bar=True, batch_size=inputs.size(0))
+        errors, phone_count = 0, 0
+        for i, wav in enumerate(wavs):
+            length = int(lengths[i].item())
+            tags = viterbi_decode(
+                logits[i, :length], self.id2label,
+                viterbi_bias=self.config.get("validation", {}).get("viterbi_bias", 5),
+            )
+            pred_segments = continuous_segments(
+                decode_bio_tags(
+                    tags, self.frame_duration, offsets[i, :length].detach().cpu()
+                ),
+                len(wav) / 16000,
+            )
+            reference = [ph for _, _, ph in segs_gt[i]]
+            prediction = [ph for _, _, ph in pred_segments]
+            errors += self._edit_distance(reference, prediction)
+            phone_count += len(reference)
 
-        for i in range(len(wavs)):
             if self.val_vis_count < self.num_vis_samples:
                 self._log_visualization(
-                    wavs[i], preds[i], lengths[i], offsets[i], segs_gt[i],
-                    sample_idx=self.val_vis_count,
+                    wav, pred_segments, segs_gt[i], self.val_vis_count
                 )
                 self.val_vis_count += 1
 
+        if phone_count:
+            self.log("val/per", logits.new_tensor(100.0 * errors / phone_count),
+                     on_step=False, on_epoch=True, prog_bar=True,
+                     batch_size=phone_count)
         return loss
-    
+
     def on_validation_epoch_end(self):
         metrics = self.trainer.callback_metrics
-        loss = metrics.get("val/loss", 0.0)
-        acc = metrics.get("val/acc", 0.0)
-        print(f"\n[Epoch {self.current_epoch}] Validation Loss: {loss:.4f} | Accuracy: {acc:.2f}%")
+        print(
+            f"\n[Epoch {self.current_epoch}] "
+            f"Loss: {metrics.get('val/loss', 0.0):.4f} | "
+            f"Frame accuracy: {metrics.get('val/acc', 0.0):.2f}% | "
+            f"PER: {metrics.get('val/per', 0.0):.2f}%"
+        )
 
-    def _log_visualization(self, wav, pred_ids, length, offset_tensor, gt_segments, sample_idx=0):
-        pred_ids = pred_ids[:length].cpu().numpy()
-        pred_tags = [self.id2label[p] for p in pred_ids]
-        curr_offsets = offset_tensor[:length].cpu()
-        
-        vis_segs = decode_bio_tags(pred_tags, self.frame_duration, offsets=curr_offsets)
-        fig = visualize_prediction(wav, 16000, vis_segs, gt_segments)
-        
-        if self.logger:
-            self.logger.experiment.add_figure(f"val/prediction_{sample_idx}", fig, global_step=self.global_step)
+    def _log_visualization(self, wav, pred_segments, gt_segments, sample_idx=0):
+        fig = visualize_prediction(wav, 16000, pred_segments, gt_segments)
+        try:
+            if self.logger:
+                self.logger.experiment.add_figure(
+                    f"val/prediction_{sample_idx}", fig,
+                    global_step=self.global_step,
+                )
+        finally:
+            plt.close(fig)
 
     def configure_optimizers(self):
         opt_name = self.config["training"].get("optimizer", "AdamW")
