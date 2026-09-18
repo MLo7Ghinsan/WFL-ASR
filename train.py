@@ -241,7 +241,7 @@ class WFLModel(pl.LightningModule):
         with torch.no_grad():
             target_env = self.envelope_extractor(wav_tensor).transpose(1, 2)
 
-        logits, offsets, pred_env = self(inputs, langs, max_len)
+        logits, offsets, pred_env = self(inputs, langs, lengths)
         loss, _, _, _ = self.calculate_loss(logits, offsets, pred_env, target_env, labels, segs_gt, lengths)
         
         preds = torch.argmax(logits, dim=-1)
