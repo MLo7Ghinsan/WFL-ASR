@@ -1,9 +1,35 @@
 import os
+import math
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torchaudio
 from transformers import WhisperFeatureExtractor, WhisperModel
 
+def masked_conv(stack, x, valid):
+    mask = valid.unsqueeze(1)
+    x = x.masked_fill(~mask, 0)
+    layers = stack if isinstance(stack, nn.Sequential) else [stack]
+
+    for layer in layers:
+        if isinstance(layer, nn.BatchNorm1d):
+            values = x.transpose(1, 2)[valid]
+            if layer.training and values.size(0) == 1:
+                values = F.batch_norm(
+                    values, layer.running_mean, layer.running_var,
+                    layer.weight, layer.bias, training=False, eps=layer.eps,
+                )
+            else:
+                values = layer(values)
+            out = x.new_zeros(x.size(0), x.size(2), x.size(1))
+            out[valid] = values.to(x.dtype)
+            x = out.transpose(1, 2)
+        else:
+            x = layer(x)
+        x = x.masked_fill(~mask, 0)
+
+    return x
+    
 class FocalLoss(nn.Module):
     def __init__(self, alpha=0.25, gamma=2.0, ignore_index=-100):
         super().__init__()
@@ -65,17 +91,18 @@ class ConformerBlock(nn.Module):
             nn.Dropout(dropout)
         )
 
-    def forward(self, x):
-        x = x + 0.5 * self.ff1(x)
-        attn_out, _ = self.self_attn(x, x, x)
-        x = self.ln1(x + attn_out)
-        x_ln = self.ln2(x)
-        x_conv = self.conv(x_ln.transpose(1, 2)).transpose(1, 2)
-        if x.size(1) != x_conv.size(1): 
-             x_conv = x_conv[:, :x.size(1)]
-        x = x + x_conv
-        x = x + 0.5 * self.ff2(x)
-        return x
+    def forward(self, x, valid):
+        mask = valid.unsqueeze(-1)
+        x = (x + 0.5 * self.ff1(x)).masked_fill(~mask, 0)
+        attn_out, _ = self.self_attn(
+            x, x, x, key_padding_mask=~valid, need_weights=False
+        )
+        x = self.ln1(x + attn_out).masked_fill(~mask, 0)
+        x_conv = masked_conv(
+            self.conv, self.ln2(x).transpose(1, 2), valid
+        ).transpose(1, 2)
+        x = (x + x_conv).masked_fill(~mask, 0)
+        return (x + 0.5 * self.ff2(x)).masked_fill(~mask, 0)
 
 class BIOPhonemeTagger(nn.Module):
     def __init__(self, config, label_list):
@@ -170,37 +197,63 @@ class BIOPhonemeTagger(nn.Module):
         self.label2id = {label: i for i, label in enumerate(label_list)}
         self.id2label = {i: label for label, i in self.label2id.items()}
 
-    def forward(self, input_values, lang_id=None, max_label_len=None):
+    def forward(self, input_values, lang_id=None, max_label_len=None, lengths=None):
         if self.encoder_type == "whisper":
-            features = self.feature_extractor(input_values.cpu().numpy(), sampling_rate=16000, return_tensors="pt")
+            features = self.feature_extractor(
+                input_values.cpu().numpy(), sampling_rate=16000,
+                return_tensors="pt",
+            )
             input_features = features["input_features"].to(input_values.device)
             hidden_states = self.encoder(input_features).last_hidden_state
         else:
             hidden_states = self.mel_extractor(input_values).transpose(1, 2)
 
+        if lengths is None:
+            frame_samples = (
+                self.config["data"]["sample_rate"]
+                * self.config["data"].get("frame_duration", 0.02)
+            )
+            count = (
+                int(max_label_len) if max_label_len is not None
+                else math.ceil(input_values.size(-1) / frame_samples)
+            )
+            lengths = [count] * input_values.size(0)
+
+        lengths = torch.as_tensor(
+            lengths, dtype=torch.long, device=input_values.device
+        )
+        if lengths.shape != (input_values.size(0),) or (lengths < 1).any():
+            raise ValueError("Expected one positive frame length per sample.")
+
+        max_len = int(lengths.max().item())
+        if max_len > hidden_states.size(1):
+            raise ValueError("Labels exceed encoder output. Split long audio first.")
+
         if self.training:
             hidden_states = self.spec_aug(hidden_states)
 
-        if max_label_len is not None:
-            if hidden_states.size(1) > max_label_len:
-                hidden_states = hidden_states[:, :max_label_len, :]
-            elif hidden_states.size(1) < max_label_len:
-                pad = torch.zeros(hidden_states.size(0), max_label_len - hidden_states.size(1), hidden_states.size(2), device=hidden_states.device)
-                hidden_states = torch.cat([hidden_states, pad], dim=1)
+        hidden_states = hidden_states[:, :max_len]
+        valid = torch.arange(max_len, device=input_values.device)[None, :] < lengths[:, None]
+        mask = valid.unsqueeze(-1)
 
         if lang_id is not None:
-            lang_embed = self.lang_emb(lang_id).unsqueeze(1).expand(-1, hidden_states.size(1), -1)
-            hidden_states = self.lang_proj(torch.cat([hidden_states, lang_embed], dim=-1))
+            lang_embed = self.lang_emb(lang_id).unsqueeze(1).expand(-1, max_len, -1)
+            hidden_states = self.lang_proj(
+                torch.cat([hidden_states, lang_embed], dim=-1)
+            )
 
-        out = hidden_states
+        out = hidden_states.masked_fill(~mask, 0)
         for layer in self.conformer_layers:
-            out = layer(out)
+            out = layer(out, valid)
 
-        out = self.dilated_conv_stack(out.transpose(1, 2)).transpose(1, 2)
+        out = masked_conv(
+            self.dilated_conv_stack, out.transpose(1, 2), valid
+        ).transpose(1, 2)
 
-        logits = self.classifier(out)
-        offsets = self.boundary_offset_head(out.transpose(1, 2)).transpose(1, 2)
-        
-        pred_envelope = self.envelope_head(out)
-        
+        logits = self.classifier(out).masked_fill(~mask, 0)
+        offsets = masked_conv(
+            self.boundary_offset_head, out.transpose(1, 2), valid
+        ).transpose(1, 2)
+        pred_envelope = self.envelope_head(out).masked_fill(~mask, 0)
+
         return logits, offsets, pred_envelope
