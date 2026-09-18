@@ -71,7 +71,8 @@ class PhonemeDataset(Dataset):
             wav = np.clip(wav, -1.0, 1.0)
 
         label_ids = torch.tensor(
-            [self.label2id[tag] for tag in tags], dtype=torch.long
+            [-100 if tag == "O" else self.label2id[tag] for tag in tags],
+            dtype=torch.long,
         )
         wav_tensor = torch.tensor(wav, dtype=torch.float32)
         return (
@@ -258,9 +259,10 @@ class WFLModel(pl.LightningModule):
 
         valid = labels != -100
         frame_count = int(valid.sum().item())
-        acc = (logits.argmax(-1)[valid] == labels[valid]).float().mean() * 100
-        self.log("val/acc", acc, on_step=False, on_epoch=True,
-                 prog_bar=True, batch_size=max(frame_count, 1))
+        if frame_count:
+            acc = (logits.argmax(-1)[valid] == labels[valid]).float().mean() * 100
+            self.log("val/acc", acc, on_step=False, on_epoch=True,
+                     prog_bar=True, batch_size=frame_count)
         for name, value in (
             ("loss", loss), ("cls_loss", cls_loss), ("off_loss", off_loss)
         ):
@@ -286,8 +288,9 @@ class WFLModel(pl.LightningModule):
             prediction = self._collapse_phones(
                 [ph for _, _, ph in pred_segments]
             )
-            errors += self._edit_distance(reference, prediction)
-            phone_count += len(reference)
+            if (labels[i, :length] != -100).all().item():
+                errors += self._edit_distance(reference, prediction)
+                phone_count += len(reference)
 
             if self.val_vis_count < self.num_vis_samples:
                 self._log_visualization(
@@ -307,7 +310,7 @@ class WFLModel(pl.LightningModule):
             f"\n[Epoch {self.current_epoch}] "
             f"Loss: {metrics.get('val/loss', 0.0):.4f} | "
             f"Frame accuracy: {metrics.get('val/acc', 0.0):.2f}% | "
-            f"PER: {metrics.get('val/per', 0.0):.2f}%"
+            f"PER: {metrics.get('val/per', float('nan')):.2f}%"
         )
 
     def _log_visualization(self, wav, pred_segments, gt_segments, sample_idx=0):
