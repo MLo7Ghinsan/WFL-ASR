@@ -126,7 +126,7 @@ class BIOPhonemeTagger(nn.Module):
             self.feature_extractor = WhisperFeatureExtractor.from_pretrained(encoder_dir)
             self.encoder = WhisperModel.from_pretrained(encoder_dir).encoder
             hidden_size = self.encoder.config.d_model
-            self.layer_weights = nn.Parameter(torh.zeros(len(self.encoder.layers) + 1))
+            self.layer_weights = nn.Parameter(torch.zeros(len(self.encoder.layers) + 1))
         else:
             self.encoder = None
             self.feature_extractor = None
@@ -198,11 +198,14 @@ class BIOPhonemeTagger(nn.Module):
                 return_tensors="pt",
             )
             input_features = features["input_features"].to(input_values.device)
-            encoder_out = self.encoder(input_features, output_hidden_states=True)
+            encoder_out = self.encoder(
+                input_features, output_hidden_states=True, return_dict=True
+            )
             weights = self.layer_weights.softmax(dim=0)
-            hidden_states = sum(weight.to(state.dtype) * F.layer_norm(state, (state.size(-1)),
-                            for weight, state in zip(weights, encoder_out.hidden_states))
-                            )
+            hidden_states = sum(
+                weight.to(state.dtype) * F.layer_norm(state, (state.size(-1),))
+                for weight, state in zip(weights, encoder_out.hidden_states)
+            )
         else:
             hidden_states = self.mel_extractor(input_values).transpose(1, 2)
 
