@@ -27,9 +27,6 @@ model:
 
   subframe_loss_weight: 5.0
 
-  envelope_dim: 20
-  envelope_loss_weight: 0.5
-
   lang_emb_dim: 128
   num_languages: 0
 
