@@ -16,7 +16,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
-from torch.utils.data import Dataset, DataLoader, random_split
+from torch.utils.data import Dataset, DataLoader, Subset, random_split
 from model import BIOPhonemeTagger, FocalLoss
 from utils import decode_bio_tags, visualize_prediction, load_phoneme_list
 import pytorch_optimizer as optim
@@ -67,15 +67,26 @@ class WFLDataModule(pl.LightningDataModule):
 
     def setup(self, stage=None):
         dataset_path = os.path.join(self.save_dir, "dataset.json")
-        full_ds = PhonemeDataset(
-            dataset_path, 
-            self.label_list, 
-            self.config["data"]["max_seq_len"], 
-            self.config.get("augmentation")
+        train_dataset = PhonemeDataset(
+            dataset_path,
+            self.label_list,
+            max_seq_len=self.config["data"]["max_seq_len"],
+            aug_cfg=self.config.get("augmentation"),
         )
+        val_dataset = PhonemeDataset(
+            dataset_path,
+            self.label_list,
+            max_seq_len=self.config["data"]["max_seq_len"],
+            aug_cfg={"enable": False},
+        )
+
         val_count = self.config["data"]["num_val_files"]
-        train_len = len(full_ds) - val_count
-        self.train_ds, self.val_ds = random_split(full_ds, [train_len, val_count])
+        train_len = len(train_dataset) - val_count
+        self.train_ds, val_split = random_split(
+            train_dataset,
+            [train_len, val_count],
+        )
+        self.val_ds = Subset(val_dataset, val_split.indices)
 
     def train_dataloader(self):
         return DataLoader(self.train_ds, batch_size=self.batch_size, shuffle=True, 
