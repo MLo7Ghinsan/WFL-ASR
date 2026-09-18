@@ -234,7 +234,7 @@ def process_audio(
         lengths = torch.tensor([expected_frames], device=device)
 
         with torch.no_grad():
-            logits, offsets, _ = model(
+            logits, offsets = model(
                 input_values, lang_tensor, lengths=lengths
             )
 
