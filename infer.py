@@ -188,6 +188,8 @@ def continuous_segments(segments, duration):
             continue
         starts.append((s, ph))
 
+    if not starts:
+        return []
     start[0] = (0.0, starts[0][1])
     return [(s, starts[i + 1][0] if i + 1 < len(starts) else duration, ph)
            for i, (s, ph) in enumerate(starts)]
