@@ -11,6 +11,7 @@ import argparse
 import numpy as np
 import soundfile as sf
 import torchaudio
+import math
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -30,19 +31,37 @@ def collate_fn(batch):
     return padded_input, padded_labels, wavs, segments_gt, wav_paths, torch.tensor(lang_ids, dtype=torch.long), label_lengths
 
 class PhonemeDataset(Dataset):
-    def __init__(self, dataset_path, label_list, max_seq_len=None, aug_cfg=None):
+    def __init__(self, dataset_path, label_list, max_seq_len=None, aug_cfg=None,
+                 frame_duration=0.02):
         with open(dataset_path, "r") as f: self.samples = json.load(f)
         self.label2id = {l: i for i, l in enumerate(label_list)}
         self.max_seq_len = max_seq_len
+        self.frame_duration = frame_duration
         self.aug_cfg = aug_cfg or {"enable": False}
 
     def __len__(self): return len(self.samples)
 
     def __getitem__(self, idx):
         sample = self.samples[idx]
-        wav, sr = sf.read(sample["wav_path"])
-        if sr != 16000: 
-            wav = torchaudio.functional.resample(torch.tensor(wav), sr, 16000).numpy()
+        wav, sr = sf.read(sample["wav_path"], dtype="float32")
+        if wav.ndim == 2:
+            wav = wav.mean(axis=1)
+        if sr != 16000:
+            wav = torchaudio.functional.resample(
+                torch.from_numpy(wav), sr, 16000
+            ).numpy()
+
+        if self.max_seq_len:
+            wav = wav[:self.max_seq_len]
+
+        duration = len(wav) / 16000
+        num_frames = math.ceil(len(wav) / (16000 * self.frame_duration))
+        tags = sample["bio_tags"][:num_frames]
+        segments = [
+            (s, min(e, duration), ph)
+            for s, e, ph in sample["phoneme_segments"]
+            if 0 <= s < min(e, duration)
+        ]
 
         if self.aug_cfg.get("enable", False) and random.random() < self.aug_cfg.get("prob", 0.5):
             wav *= random.uniform(*self.aug_cfg.get("volume_range", [0.9, 1.1]))
@@ -50,11 +69,14 @@ class PhonemeDataset(Dataset):
                 wav += np.random.normal(0, self.aug_cfg["noise_std"], wav.shape)
             wav = np.clip(wav, -1.0, 1.0)
 
-        label_ids = torch.tensor([self.label2id.get(tag, self.label2id["O"]) for tag in sample["bio_tags"]], dtype=torch.long)
+        label_ids = torch.tensor(
+            [self.label2id[tag] for tag in tags], dtype=torch.long
+        )
         wav_tensor = torch.tensor(wav, dtype=torch.float32)
-        if self.max_seq_len: wav_tensor = wav_tensor[:self.max_seq_len]
-        
-        return wav_tensor, label_ids, wav, sample["phoneme_segments"], sample["wav_path"], sample["lang_id"]
+        return (
+            wav_tensor, label_ids, wav, segments,
+            sample["wav_path"], sample["lang_id"],
+        )
 
 class WFLDataModule(pl.LightningDataModule):
     def __init__(self, config, label_list):
@@ -67,16 +89,22 @@ class WFLDataModule(pl.LightningDataModule):
 
     def setup(self, stage=None):
         dataset_path = os.path.join(self.save_dir, "dataset.json")
+        max_seq_len = self.config["data"].get("max_seq_len")
+        if self.config["model"].get("encoder_type", "whisper").lower() == "whisper":
+            max_seq_len = min(max_seq_len or 480000, 480000)
+            
         train_dataset = PhonemeDataset(
             dataset_path,
             self.label_list,
-            max_seq_len=self.config["data"]["max_seq_len"],
+            max_seq_len=max_seq_len,
+            frame_duration=self.config["data"].get("frame_duration", 0.02),
             aug_cfg=self.config.get("augmentation"),
         )
         val_dataset = PhonemeDataset(
             dataset_path,
             self.label_list,
-            max_seq_len=self.config["data"]["max_seq_len"],
+            max_seq_len=max_seq_len,
+            frame_duration=self.config["data"].get("frame_duration", 0.02),
             aug_cfg={"enable": False},
         )
 
