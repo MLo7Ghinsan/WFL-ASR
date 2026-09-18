@@ -88,14 +88,23 @@ def preprocess(data_dir, config):
                     ph = p[2]
                     # merge
                     ph = merge_map.get(lang, {}).get(ph, ph)
-                    segs.append((int(p[0])/1e7, int(p[1])/1e7, ph))
+                    start, end = int(p[0]) / 1e7, int(p[1]) / 1e7
+                    if start == end or start >= dur:
+                        continue
+                    end = min(end, dur)
+                    segs.append((start, end, ph))
                     phoneme_set.add(ph)
                     lang_phonemes[lang].add(ph)
             
+            if not segs or num_frames < 1:
+                print(f"[SKIP] No usable labels or audio: {lab}")
+                continue
+
             try:
                 tags = to_bio_tags(segs, num_frames, frame_dur, dur)
             except ValueError as e:
-                raise ValueError(f"{lab}: {e}") from e
+                print(f"[SKIP] {lab}: {e}")
+                continue
             dataset.append({
                 "wav_path": wav, "bio_tags": tags, 
                 "phoneme_segments": segs, "lang_id": lang2id[lang]
