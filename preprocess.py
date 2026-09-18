@@ -15,7 +15,7 @@ def to_bio_tags(phonemes, num_frames, frame_duration, audio_duration):
         raise ValueError("Empty labels or audio.")
 
     tags = ["O"] * num_frames
-    previous_end, previous_start_frame = 0.0, -1
+    previous_end = 0.0
 
     for start, end, ph in phonemes:
         if not 0 <= start < end <= audio_duration + 1e-7:
@@ -26,16 +26,11 @@ def to_bio_tags(phonemes, num_frames, frame_duration, audio_duration):
         s_idx = int(start / frame_duration)
         e_idx = min(int(end / frame_duration), num_frames - 1)
 
-        if s_idx >= num_frames:
-            raise ValueError(f"Phoneme starts outside the frame grid: {ph} ... EXCUSE ME HOW???\nAchievement unlocked: How Did We Get Here?")
-        if s_idx == previous_start_frame:
-            raise ValueError(f"Multiple phoneme starts in frame {s_idx}: {ph} ... EXCUSE ME HOW???\nAchievement unlocked: How Did We Get Here?")
-
         tags[s_idx] = f"B-{ph}"
         for i in range(s_idx + 1, e_idx + 1):
             tags[i] = f"I-{ph}"
 
-        previous_end, previous_start_frame = end, s_idx
+        previous_end = end
 
     return tags
 
