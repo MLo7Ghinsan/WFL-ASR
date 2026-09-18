@@ -177,6 +177,21 @@ def apply_hard_silence(segments, audio, sr, threshold, min_duration, silence_pho
     return temp_segments
 
 
+def continuous_segments(segments, duration):
+    if duration <= 0:
+        return []
+    starts = []
+    for s, _, ph in sorted(segments, key=lambda seg:seg[0]):
+        s = float(s)
+        s = max(0.0, s)
+        if s >= duration or (starts and s <= starts[-1][0]):
+            continue
+        starts.append((s, ph))
+
+    start[0] = (0.0, starts[0][1])
+    return [(s, starts[i + 1][0] if i + 1 < len(starts) else duration, ph)
+           for i, (s, ph) in enumerate(starts)]
+
 def process_audio(
     model,
     audio,
@@ -260,39 +275,7 @@ def process_audio(
             ph = canonical_to_lang(ph, lang_name, merge_map)
         all_segments.append((s, e, ph))
 
-    valid_segments = []
-    for s, e, ph in all_segments:
-        if s >= original_duration:
-            continue
-
-        if e > original_duration:
-            e = original_duration
-
-        valid_segments.append((s, e, ph))
-
-    if not valid_segments:
-        return [(0.0, original_duration, "sil")]
-
-    valid_segments.sort(key=lambda x: x[0])
-    final_segments = []
-
-    if valid_segments and valid_segments[0][0] > 0.0:
-        final_segments.append((0.0, valid_segments[0][0], "SP"))
-
-    for i, (s, e, ph) in enumerate(valid_segments):
-        if final_segments:
-            prev_s, prev_e, prev_ph = final_segments[-1]
-            if prev_e < s:
-                final_segments[-1] = (prev_s, s, prev_ph)
-
-        final_segments.append((s, e, ph))
-
-    if final_segments:
-        last_s, last_e, last_ph = final_segments[-1]
-        if last_e < original_duration:
-            final_segments[-1] = (last_s, original_duration, last_ph)
-
-    return final_segments
+    return continuous_segments(all_segments, original_duration)
 
 
 @click.command()
@@ -492,6 +475,7 @@ def main(
                 silence_phoneme=silence_phoneme,
             )
 
+        segments = continuous_segments(segments, len(audio) / sr)
         out_path = wav_path.replace(".wav", ".lab")
         save_lab(out_path, segments)
         print(f"Saved -> {out_path}")
