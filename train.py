@@ -166,8 +166,8 @@ class WFLModel(pl.LightningModule):
             }
         )
 
-    def forward(self, x, lang_ids, max_len=None):
-        return self.model(x, lang_ids, max_label_len=max_len)
+    def forward(self, x, lang_ids, lengths):
+        return self.model(x, lang_ids, lengths=lengths)
 
     def calculate_loss(self, logits, offsets, pred_env, target_env, labels, segs_gt, lengths):
         cls_loss = self.criterion(logits.reshape(-1, logits.size(-1)), labels.reshape(-1))
@@ -209,7 +209,6 @@ class WFLModel(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         inputs, labels, wavs, segs_gt, _, langs, lengths = batch
-        max_len = torch.max(lengths) if lengths.numel() > 0 else 0
         
         wav_tensor = torch.nn.utils.rnn.pad_sequence(
             [torch.tensor(w, dtype=torch.float32) for w in wavs], batch_first=True
@@ -218,7 +217,7 @@ class WFLModel(pl.LightningModule):
         with torch.no_grad():
             target_env = self.envelope_extractor(wav_tensor).transpose(1, 2)
 
-        logits, offsets, pred_env = self(inputs, langs, max_len)
+        logits, offsets, pred_env = self(inputs, langs, lengths)
         loss, cls_loss, off_loss, env_loss = self.calculate_loss(
             logits, offsets, pred_env, target_env, labels, segs_gt, lengths
         )
@@ -234,7 +233,6 @@ class WFLModel(pl.LightningModule):
 
     def validation_step(self, batch, batch_idx):
         inputs, labels, wavs, segs_gt, _, langs, lengths = batch
-        max_len = torch.max(lengths) if lengths.numel() > 0 else 0
         
         wav_tensor = torch.nn.utils.rnn.pad_sequence(
             [torch.tensor(w, dtype=torch.float32) for w in wavs], batch_first=True
