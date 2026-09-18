@@ -228,6 +228,14 @@ class WFLModel(pl.LightningModule):
         self.val_vis_count = 0
 
     @staticmethod
+    def _collapse_phones(phones):
+        collapsed = []
+        for phone in phones:
+            if not collapsed or phone != collapsed[-1]:
+                collapsed.append(phone)
+        return collapsed
+        
+    @staticmethod
     def _edit_distance(reference, prediction):
         row = list(range(len(prediction) + 1))
         for i, ref in enumerate(reference, 1):
@@ -272,8 +280,12 @@ class WFLModel(pl.LightningModule):
                 ),
                 len(wav) / 16000,
             )
-            reference = [ph for _, _, ph in segs_gt[i]]
-            prediction = [ph for _, _, ph in pred_segments]
+            reference = self._collapse_phones(
+                [ph for _, _, ph in segs_gt[i]]
+            )
+            prediction = self._collapse_phones(
+                [ph for _, _, ph in pred_segments]
+            )
             errors += self._edit_distance(reference, prediction)
             phone_count += len(reference)
 
