@@ -88,7 +88,7 @@ def preprocess(data_dir, config):
                     ph = p[2]
                     # merge
                     ph = merge_map.get(lang, {}).get(ph, ph)
-                    start, end = int(p[0]) / 1e7, int(p[1]) / 1e7
+                    start, end = float(p[0]) / 1e7, float(p[1]) / 1e7
                     if start == end or start >= dur:
                         continue
                     end = min(end, dur)
