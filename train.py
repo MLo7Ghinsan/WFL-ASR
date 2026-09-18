@@ -80,13 +80,45 @@ class WFLDataModule(pl.LightningDataModule):
             aug_cfg={"enable": False},
         )
 
+        paths = [s["wav_path"] for s in train_dataset.samples]
+        indices = {p: i for i, p in enumerate(paths)}
         val_count = self.config["data"]["num_val_files"]
-        train_len = len(train_dataset) - val_count
-        self.train_ds, val_split = random_split(
-            train_dataset,
-            [train_len, val_count],
+        split_path = os.path.join(self.save_dir, "data_split.json")
+
+        if len(indices) != len(paths):
+            raise ValueError("Duplicate audio paths in dataset")
+        if not 0 < val_count < len(paths):
+            raise ValueError("Invalid num_val_files")
+
+        if os.path.exists(split_path):
+            with open(split_path, encoding="utf-8") as f:
+                split = json.load(f)
+        else:
+            train, val = random_split(
+                sorted(paths),
+                [len(paths) - val_count, val_count],
+                generator=torch.Generator().manual_seed(
+                    self.config["data"].get("split_seed", 42)
+                ),
+            )
+            split = {"train_paths": list(train), "val_paths": list(val)}
+            with open(split_path, "w", encoding="utf-8") as f:
+                json.dump(split, f, indent=2, ensure_ascii=False)
+
+        saved = split["train_paths"] + split["val_paths"]
+        if (
+            len(saved) != len(paths)
+            or set(saved) != set(paths)
+            or len(split["val_paths"]) != val_count
+        ):
+            raise ValueError("Split mismatch. Restore the dataset/config or rename data_split.json to create a new split")
+
+        self.train_ds = Subset(
+            train_dataset, [indices[p] for p in split["train_paths"]]
         )
-        self.val_ds = Subset(val_dataset, val_split.indices)
+        self.val_ds = Subset(
+            val_dataset, [indices[p] for p in split["val_paths"]]
+        )
 
     def train_dataloader(self):
         return DataLoader(self.train_ds, batch_size=self.batch_size, shuffle=True, 
