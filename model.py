@@ -186,13 +186,6 @@ class BIOPhonemeTagger(nn.Module):
             nn.Sigmoid()
         )
 
-        self.envelope_dim = config["model"].get("envelope_dim", 20)
-        self.envelope_head = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size // 2),
-            nn.GELU(),
-            nn.Linear(hidden_size // 2, self.envelope_dim)
-        )
-
         self.label_list = label_list
         self.label2id = {label: i for i, label in enumerate(label_list)}
         self.id2label = {i: label for label, i in self.label2id.items()}
@@ -254,6 +247,5 @@ class BIOPhonemeTagger(nn.Module):
         offsets = masked_conv(
             self.boundary_offset_head, out.transpose(1, 2), valid
         ).transpose(1, 2)
-        pred_envelope = self.envelope_head(out).masked_fill(~mask, 0)
-
-        return logits, offsets, pred_envelope
+        
+        return logits, offsets
