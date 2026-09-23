@@ -8,6 +8,7 @@ tqdm==4.67.1
 transformers==4.51.3
 click
 pytorch-optimizer
+numba
 
 # RECOMMENDED: install torch manually. Environment used: Python 3.11
 #torch==2.6.0+cu124

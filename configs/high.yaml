@@ -9,13 +9,13 @@ data:
 
 model:
   encoder_type: "whisper"
-  whisper_model: "openai/whisper-base" 
-  
+  whisper_model: "openai/whisper-base"
+
   # unfreeze almost half the encoder for deep finetuning
-  freeze_encoder: true 
-  unfreeze_last_n_layers: 6 
-  
-  num_conformer_layers: 6 
+  freeze_encoder: true
+  unfreeze_last_n_layers: 6
+
+  num_conformer_layers: 6
   conformer_heads: 8
   conformer_ff_expansion: 4
   conformer_kernel_size: 31
@@ -33,22 +33,22 @@ model:
 finetune:
   enabled: true
   checkpoint_path: "path/to/pretrained_model.ckpt"
-  freeze_backbone: false  # Set to true if you only want to train the output heads
+  freeze_backbone: false # Set to true if you only want to train the output heads
 
 training:
   batch_size: 16
   num_workers: 8
   optimizer: "AdamW"
-  
-  learning_rate: 0.00005 
+
+  learning_rate: 0.00005
   weight_decay: 0.001
-  
+
   max_epochs: 1000
   check_val_every_n_epoch: 1
-  
+
   lr_decay_every_n_epochs: 5
   lr_decay_gamma: 0.95
-  
+
   max_checkpoints: 5
   log_dir: "logs/high"
   merged_phoneme_groups: []
@@ -61,7 +61,11 @@ augmentation:
 
 output:
   save_dir: "checkpoints_high"
-  
+
 postprocess:
   median_filter: 1
   merge_segments: "right"
+  forced_alignment_args:
+    self_loop_penalty: -4.6 # penalty for staying on the phoneme
+    forward_penalty: -0.6 # penalty for switching to the next phoneme
+    skip_penalty: -2.3 # penalty for skipping I phonemes
