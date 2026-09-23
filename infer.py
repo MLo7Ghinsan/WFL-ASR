@@ -7,9 +7,8 @@ import soundfile as sf
 import torch
 import torchaudio
 import yaml
-from librosa.sequence import _viterbi, viterbi
-from librosa.util import tiny
-from numba.cuda.stubs import const
+from librosa.sequence import _viterbi
+from numba import bool, float64, njit, uint16
 
 from model import BIOPhonemeTagger
 from utils import (
@@ -116,7 +115,78 @@ def viterbi_decode(logits, id2label, viterbi_bias=1):
     return [labels[int(i)] for i in path]
 
 
-def forced_align_viterbi(logits, id2label, phones):
+@njit(
+    uint16[:](float64[:, :], uint16[:], bool[:], uint16[:], float64, float64, float64)
+)
+def _forced_align_viterbi(
+    log_probs,
+    target_seq,
+    begin_mask,
+    optional_mask,
+    self_loop_penalty,
+    forward_penalty,
+    skip_penalty,
+):
+    K = len(target_seq)
+    _, T = log_probs.shape
+    scores = np.full((K, T), -np.inf)
+    pointers = np.zeros((K, T), dtype=np.uint16)
+
+    scores[0, 0] = log_probs[target_seq[0], 0]
+
+    for t in range(1, T):
+        for s in range(K):
+            state_idx = target_seq[s]
+
+            curr_states = np.zeros(3, dtype=np.uint16)
+            curr_scores = np.zeros(3, dtype=np.float64)
+            count = 0
+            if begin_mask[s]:
+                curr_states[count] = s
+                curr_scores[count] = -np.inf
+            else:
+                curr_states[count] = s
+                curr_scores[count] = scores[s, t - 1] + self_loop_penalty
+            count += 1
+
+            if s > 0:
+                curr_states[count] = s - 1
+                curr_scores[count] = scores[s - 1, t - 1] + forward_penalty
+                count += 1
+
+            if s > 1 and optional_mask[s - 1] > 0:
+                curr_states[count] = s - optional_mask[s - 1] - 1
+                curr_scores[count] = (
+                    scores[s - optional_mask[s - 1] - 1, t - 1] + skip_penalty
+                )
+                count += 1
+
+            curr_states = curr_states[:count]
+            curr_scores = curr_scores[:count]
+            best_state_idx = np.argmax(curr_scores)
+
+            scores[s, t] = curr_scores[best_state_idx] + log_probs[state_idx, t]
+            pointers[s, t] = curr_states[best_state_idx]
+
+    path = np.zeros(T, dtype=np.uint16)
+    path[-1] = (
+        K - 2 if optional_mask[-1] > 0 and scores[-2, -1] > scores[-1, -1] else K - 1
+    )
+
+    for t in range(T - 2, -1, -1):
+        path[t] = pointers[path[t + 1], t + 1]
+
+    return path
+
+
+def forced_align_viterbi(
+    logits,
+    id2label,
+    phones,
+    self_loop_penalty=-4.6,
+    forward_penalty=-0.6,
+    skip_penalty=-2.3,
+):
     label2id = {label: id for id, label in id2label.items()}
     # turn to log probs
     log_probs = (
@@ -125,55 +195,32 @@ def forced_align_viterbi(logits, id2label, phones):
 
     # make target sequence
     target_seq = []
+    begin_mask = []
     for phn in phones:
         target_seq.extend([f"B-{phn}", f"I-{phn}"])
-    target_seq_idx = [label2id[phn] for phn in target_seq]
-
-    # forward pass setup
-    K = len(target_seq)
-    _, T = log_probs.shape
-    scores = np.full((K, T), -np.inf)
-    pointers = np.zeros((K, T), dtype=int)
-
-    scores[0, 0] = log_probs[target_seq_idx[0], 0]
-
-    for t in range(1, T):
-        for s in range(K):
-            state_idx = target_seq_idx[s]
-
-            candidates = []
-
-            if target_seq[s].startswith("B-"):
-                # disallow self transition for B phonemes
-                candidates.append((s, -np.inf))
+        begin_mask.extend([True, False])
+    target_seq_idx = np.array([label2id[phn] for phn in target_seq], dtype=np.uint16)
+    begin_mask = np.array(begin_mask, dtype=np.bool)
+    optional_mask = []
+    for phn in target_seq:
+        if phn.startswith("I-"):
+            if len(optional_mask) > 0:
+                optional_mask.append(optional_mask[-1] + 1)
             else:
-                candidates.append((s, scores[s, t - 1] - 4.6))
+                optional_mask.append(1)
+        else:
+            optional_mask.append(0)
+    optional_mask = np.array(optional_mask, dtype=np.uint16)
 
-            if s > 0:
-                candidates.append((s - 1, scores[s - 1, t - 1] - 0.6))
-
-            if (
-                s > 1
-                and target_seq[s - 1].startswith("I-")
-                and target_seq[s].startswith("B-")
-            ):
-                # I phoneme skip
-                candidates.append((s - 2, scores[s - 2, t - 1] - 2.3))
-
-            best_prev_state, best_score = max(candidates, key=lambda x: x[1])
-
-            scores[s, t] = best_score + log_probs[state_idx, t]
-            pointers[s, t] = best_prev_state
-
-    path = np.zeros(T, dtype=int)
-    path[T - 1] = (
-        K - 2
-        if target_seq[K - 1].startswith("I-")
-        and scores[K - 2, T - 1] > scores[K - 1, T - 1]
-        else K - 1
+    path = _forced_align_viterbi(
+        log_probs,
+        target_seq_idx,
+        begin_mask,
+        optional_mask,
+        self_loop_penalty,
+        forward_penalty,
+        skip_penalty,
     )
-    for t in range(T - 2, -1, -1):
-        path[t] = pointers[path[t + 1], t + 1]
 
     return [target_seq[p] for p in path]
 
@@ -324,7 +371,15 @@ def process_audio(
         if decoder == "constrained":
             pred_tags = forced_align_bio(full_logits, model.id2label, phones)
         elif decoder == "viterbi":
-            pred_tags = forced_align_viterbi(full_logits, model.id2label, phones)
+            forced_align_args = config["postprocess"].get("forced_alignment_args", {})
+            pred_tags = forced_align_viterbi(
+                full_logits,
+                model.id2label,
+                phones,
+                self_loop_penalty=forced_align_args.get("self_loop_penalty", -4.6),
+                forward_penalty=forced_align_args.get("forward_penalty", -0.6),
+                skip_penalty=forced_align_args.get("skip_penalty", -2.3),
+            )
     else:
         if decoder == "constrained":
             pred_tags = constrained_decode(full_logits, model.id2label)

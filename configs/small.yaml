@@ -10,12 +10,12 @@ data:
 model:
   encoder_type: "whisper"
   whisper_model: "openai/whisper-base"
-  
+
   # totally frozen encoder. below 30 mins is not enough to finetune whisper
-  freeze_encoder: true 
-  unfreeze_last_n_layers: 0 
-  
-  num_conformer_layers: 2 
+  freeze_encoder: true
+  unfreeze_last_n_layers: 0
+
+  num_conformer_layers: 2
   conformer_heads: 2
   conformer_ff_expansion: 2
   conformer_kernel_size: 15
@@ -25,7 +25,7 @@ model:
   dilated_conv_depth: 2
   dilated_conv_kernel: 3
 
-  subframe_loss_weight: 5.0 
+  subframe_loss_weight: 5.0
 
   lang_emb_dim: 64
   num_languages: 0
@@ -33,21 +33,21 @@ model:
 finetune:
   enabled: true
   checkpoint_path: "path/to/pretrained_model.ckpt"
-  freeze_backbone: false  # Set to true if you only want to train the output heads
+  freeze_backbone: false # Set to true if you only want to train the output heads
 
 training:
   batch_size: 4
   num_workers: 2
   optimizer: "AdamW"
-  
-  learning_rate: 0.0001 
+
+  learning_rate: 0.0001
   weight_decay: 0.01
-  
-  max_epochs: 1000 
+
+  max_epochs: 1000
   check_val_every_n_epoch: 1 # Validate every epoch
   lr_decay_every_n_epochs: 1 # lr reduce every epoch
   lr_decay_gamma: 0.9
-  
+
   max_checkpoints: 3
   log_dir: "logs/micro"
   merged_phoneme_groups: []
@@ -60,7 +60,11 @@ augmentation:
 
 output:
   save_dir: "checkpoints_micro"
-  
+
 postprocess:
   median_filter: 1
   merge_segments: "right"
+  forced_alignment_args:
+    self_loop_penalty: -4.6 # penalty for staying on the phoneme
+    forward_penalty: -0.6 # penalty for switching to the next phoneme
+    skip_penalty: -2.3 # penalty for skipping I phonemes
