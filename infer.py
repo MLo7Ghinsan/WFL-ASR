@@ -65,7 +65,7 @@ def bio_inputs(logits, id2label):
     scores = scores[:, keep]
     labels = [labels[i] for i in keep]
 
-    starts = np.array([tag.startswith("B-") for tag in labels], dtype=bool)
+    starts = np.array([tag.startswith("B-") for tag in labels], dtype=np.bool)
     if not starts.any():
         raise ValueError("Decoder requires at least one B- label.")
 
@@ -78,7 +78,7 @@ def bio_inputs(logits, id2label):
             ]
             for prev in labels
         ],
-        dtype=bool,
+        dtype=np.bool,
     )
 
     return scores, labels, allowed, starts
