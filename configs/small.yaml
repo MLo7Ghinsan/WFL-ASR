@@ -48,6 +48,8 @@ training:
   lr_decay_every_n_epochs: 1 # lr reduce every epoch
   lr_decay_gamma: 0.9
 
+  accumulate_grad_batches: 1
+
   max_checkpoints: 3
   log_dir: "logs/micro"
   merged_phoneme_groups: []
