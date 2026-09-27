@@ -499,7 +499,7 @@ def main():
         ),
         accelerator="auto",
         devices=1,
-        precision="32",
+        precision=config["training"].get("precision", "32"),
         accumulate_grad_batches=config["training"].get("accumulate_grad_batches", 1),
         gradient_clip_val=1.0,
         log_every_n_steps=10,
