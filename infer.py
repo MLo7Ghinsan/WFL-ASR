@@ -186,6 +186,7 @@ def forced_align_viterbi(
     self_loop_penalty=-4.6,
     forward_penalty=-0.6,
     skip_penalty=-2.3,
+    visualize_probabilities=False,
 ):
     label2id = {label: id for id, label in id2label.items()}
     # turn to log probs
@@ -221,6 +222,22 @@ def forced_align_viterbi(
         forward_penalty,
         skip_penalty,
     )
+
+    if visualize_probabilities:
+        import matplotlib.pyplot as plt
+
+        clean_probs = np.exp(log_probs)[target_seq_idx, :].copy()
+        min_prob = clean_probs.min()
+
+        path_tokens = target_seq_idx[path]
+        token_match = target_seq_idx[:, None] == path_tokens
+
+        path_mask = np.ones_like(clean_probs, dtype=np.bool)
+        path_mask[path, np.arange(len(path))] = False
+
+        clean_probs[token_match & path_mask] = min_prob
+
+        plt.imshow(clean_probs, aspect="auto", interpolation="none")
 
     return [target_seq[p] for p in path]
 
@@ -319,7 +336,12 @@ def process_audio(
     no_use_offset=False,
     decoder="constrained",
     viterbi_bias=5,
+    visualize_probabilities=False,
+    visualize_labels=False,
 ):
+    if visualize_probabilities:
+        import matplotlib.pyplot as plt
+
     if len(audio) == 0:
         return []
     original_duration = len(audio) / sr
@@ -379,8 +401,16 @@ def process_audio(
                 self_loop_penalty=forced_align_args.get("self_loop_penalty", -4.6),
                 forward_penalty=forced_align_args.get("forward_penalty", -0.6),
                 skip_penalty=forced_align_args.get("skip_penalty", -2.3),
+                visualize_probabilities=visualize_probabilities,
             )
     else:
+        if visualize_probabilities:
+            plt.imshow(
+                torch.softmax(full_logits, dim=-1).numpy().transpose(),
+                aspect="auto",
+                interpolation="none",
+            )
+
         if decoder == "constrained":
             pred_tags = constrained_decode(full_logits, model.id2label)
         elif decoder == "viterbi":
@@ -398,7 +428,28 @@ def process_audio(
             ph = canonical_to_lang(ph, lang_name, merge_map)
         all_segments.append((s, e, ph))
 
-    return continuous_segments(all_segments, original_duration)
+    continuous_seg = continuous_segments(all_segments, original_duration)
+
+    if visualize_probabilities:
+        if visualize_labels:
+            for s, e, ph in continuous_seg:
+                s /= config["data"]["frame_duration"]
+                e /= config["data"]["frame_duration"]
+                plt.axvline(s, color="white", linestyle="--")
+                plt.text(
+                    (s + e) / 2,
+                    0,
+                    ph,
+                    color="white",
+                    ha="center",
+                    va="top",
+                    fontsize=12,
+                    fontweight="bold",
+                )
+        plt.tight_layout()
+        plt.show()
+
+    return continuous_seg
 
 
 @click.command()
@@ -464,6 +515,18 @@ def process_audio(
     type=float,
     help="Amount of bias (>=1) added to frames of the same phoneme for viterbi decoding. (default: 5)",
 )
+@click.option(
+    "--visualize-probabilities",
+    "-vprobs",
+    is_flag=True,
+    help="Visualize the probabilities predicted by the model",
+)
+@click.option(
+    "--visualize-labels",
+    "-vlabs",
+    is_flag=True,
+    help="Visualize the predicted labels when visualizing probabilities",
+)
 def main(
     input_path,
     checkpoint,
@@ -475,6 +538,8 @@ def main(
     min_silence_duration,
     decoder_type,
     viterbi_bias,
+    visualize_probabilities,
+    visualize_labels,
 ):
     cfg = load_config(config)
     device = (
@@ -578,9 +643,14 @@ def main(
             no_use_offset=no_use_offset,
             decoder=decoder_type,
             viterbi_bias=viterbi_bias,
+            visualize_probabilities=visualize_probabilities,
+            visualize_labels=visualize_labels,
         )
 
-        if cfg.get("postprocess", {}).get("merge_segments", "right") != "none":
+        if (
+            cfg.get("postprocess", {}).get("merge_segments", "right") != "none"
+            and phones is None
+        ):
             segments = merge_adjacent_segments(
                 segments, cfg["postprocess"]["merge_segments"]
             )

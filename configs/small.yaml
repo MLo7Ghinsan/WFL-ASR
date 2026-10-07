@@ -48,6 +48,9 @@ training:
   lr_decay_every_n_epochs: 1 # lr reduce every epoch
   lr_decay_gamma: 0.9
 
+  precision: 32 # see PyTorch Lightning precision https://lightning.ai/docs/pytorch/stable/reference/common/precision_basic
+  accumulate_grad_batches: 1
+
   max_checkpoints: 3
   log_dir: "logs/micro"
   merged_phoneme_groups: []

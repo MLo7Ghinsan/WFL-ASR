@@ -1,46 +1,70 @@
 import os
 
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'  
-os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0' 
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
 
-import json
-import yaml
-import torch
-import random
 import argparse
+import json
+import math
+import random
+
+import matplotlib
 import numpy as np
 import soundfile as sf
+import torch
 import torchaudio
-import math
-import matplotlib
+import yaml
+
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import pytorch_lightning as pl
-from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
-from torch.utils.data import Dataset, DataLoader, Subset, random_split
-from model import BIOPhonemeTagger, FocalLoss
-from utils import decode_bio_tags, visualize_prediction, load_phoneme_list
 import pytorch_optimizer as optim
-from infer import viterbi_decode, continuous_segments
+from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
+from torch.utils.data import DataLoader, Dataset, Subset, random_split
+
+from infer import continuous_segments, viterbi_decode
+from model import BIOPhonemeTagger, FocalLoss
+from utils import decode_bio_tags, load_phoneme_list, visualize_prediction
 
 
 def collate_fn(batch):
     input_values, label_ids, wavs, segments_gt, wav_paths, lang_ids = zip(*batch)
     label_lengths = torch.tensor([len(x) for x in label_ids])
-    padded_input = torch.nn.utils.rnn.pad_sequence(input_values, batch_first=True, padding_value=0.0)
-    padded_labels = torch.nn.utils.rnn.pad_sequence(label_ids, batch_first=True, padding_value=-100)
-    return padded_input, padded_labels, wavs, segments_gt, wav_paths, torch.tensor(lang_ids, dtype=torch.long), label_lengths
+    padded_input = torch.nn.utils.rnn.pad_sequence(
+        input_values, batch_first=True, padding_value=0.0
+    )
+    padded_labels = torch.nn.utils.rnn.pad_sequence(
+        label_ids, batch_first=True, padding_value=-100
+    )
+    return (
+        padded_input,
+        padded_labels,
+        wavs,
+        segments_gt,
+        wav_paths,
+        torch.tensor(lang_ids, dtype=torch.long),
+        label_lengths,
+    )
+
 
 class PhonemeDataset(Dataset):
-    def __init__(self, dataset_path, label_list, max_seq_len=None, aug_cfg=None,
-                 frame_duration=0.02):
-        with open(dataset_path, "r") as f: self.samples = json.load(f)
+    def __init__(
+        self,
+        dataset_path,
+        label_list,
+        max_seq_len=None,
+        aug_cfg=None,
+        frame_duration=0.02,
+    ):
+        with open(dataset_path, "r") as f:
+            self.samples = json.load(f)
         self.label2id = {l: i for i, l in enumerate(label_list)}
         self.max_seq_len = max_seq_len
         self.frame_duration = frame_duration
         self.aug_cfg = aug_cfg or {"enable": False}
 
-    def __len__(self): return len(self.samples)
+    def __len__(self):
+        return len(self.samples)
 
     def __getitem__(self, idx):
         sample = self.samples[idx]
@@ -53,7 +77,7 @@ class PhonemeDataset(Dataset):
             ).numpy()
 
         if self.max_seq_len:
-            wav = wav[:self.max_seq_len]
+            wav = wav[: self.max_seq_len]
 
         duration = len(wav) / 16000
         num_frames = math.ceil(len(wav) / (16000 * self.frame_duration))
@@ -64,7 +88,9 @@ class PhonemeDataset(Dataset):
             if 0 <= s < min(e, duration)
         ]
 
-        if self.aug_cfg.get("enable", False) and random.random() < self.aug_cfg.get("prob", 0.5):
+        if self.aug_cfg.get("enable", False) and random.random() < self.aug_cfg.get(
+            "prob", 0.5
+        ):
             wav *= random.uniform(*self.aug_cfg.get("volume_range", [0.9, 1.1]))
             if self.aug_cfg.get("noise_std", 0) > 0:
                 wav += np.random.normal(0, self.aug_cfg["noise_std"], wav.shape)
@@ -76,9 +102,14 @@ class PhonemeDataset(Dataset):
         )
         wav_tensor = torch.tensor(wav, dtype=torch.float32)
         return (
-            wav_tensor, label_ids, wav, segments,
-            sample["wav_path"], sample["lang_id"],
+            wav_tensor,
+            label_ids,
+            wav,
+            segments,
+            sample["wav_path"],
+            sample["lang_id"],
         )
+
 
 class WFLDataModule(pl.LightningDataModule):
     def __init__(self, config, label_list):
@@ -94,7 +125,7 @@ class WFLDataModule(pl.LightningDataModule):
         max_seq_len = self.config["data"].get("max_seq_len")
         if self.config["model"].get("encoder_type", "whisper").lower() == "whisper":
             max_seq_len = min(max_seq_len or 480000, 480000)
-            
+
         train_dataset = PhonemeDataset(
             dataset_path,
             self.label_list,
@@ -141,44 +172,59 @@ class WFLDataModule(pl.LightningDataModule):
             or set(saved) != set(paths)
             or len(split["val_paths"]) != val_count
         ):
-            raise ValueError("Split mismatch. Restore the dataset/config or rename data_split.json to create a new split")
+            raise ValueError(
+                "Split mismatch. Restore the dataset/config or rename data_split.json to create a new split"
+            )
 
         self.train_ds = Subset(
             train_dataset, [indices[p] for p in split["train_paths"]]
         )
-        self.val_ds = Subset(
-            val_dataset, [indices[p] for p in split["val_paths"]]
-        )
+        self.val_ds = Subset(val_dataset, [indices[p] for p in split["val_paths"]])
 
     def train_dataloader(self):
-        return DataLoader(self.train_ds, batch_size=self.batch_size, shuffle=True, 
-                          collate_fn=collate_fn, num_workers=self.num_workers, pin_memory=True, persistent_workers=True)
+        return DataLoader(
+            self.train_ds,
+            batch_size=self.batch_size,
+            shuffle=True,
+            collate_fn=collate_fn,
+            num_workers=self.num_workers,
+            pin_memory=True,
+            persistent_workers=True,
+        )
 
     def val_dataloader(self):
-        return DataLoader(self.val_ds, batch_size=self.batch_size, shuffle=False, 
-                          collate_fn=collate_fn, num_workers=self.num_workers, pin_memory=True, persistent_workers=True)
+        return DataLoader(
+            self.val_ds,
+            batch_size=self.batch_size,
+            shuffle=False,
+            collate_fn=collate_fn,
+            num_workers=self.num_workers,
+            pin_memory=True,
+            persistent_workers=True,
+        )
+
 
 class WFLModel(pl.LightningModule):
     def __init__(self, config, label_list):
         super().__init__()
-        self.save_hyperparameters(ignore=['model']) 
+        self.save_hyperparameters(ignore=["model"])
         self.config = config
         self.label_list = label_list
         self.id2label = {i: l for i, l in enumerate(label_list)}
-        
+
         self.model = BIOPhonemeTagger(config, label_list)
-        
+
         if config.get("finetune", {}).get("freeze_backbone", False):
             print(">>> Fine-tuning mode: Freezing Conformer backbone.")
             for param in self.model.conformer.parameters():
                 param.requires_grad = False
-                
+
         self.criterion = FocalLoss(alpha=0.5, gamma=2.0, ignore_index=-100)
         self.offset_weight = config["model"].get("subframe_loss_weight", 5.0)
         self.frame_duration = config["data"].get("frame_duration", 0.02)
-        
+
         total_val = config["data"]["num_val_files"]
-        self.num_vis_samples = min(total_val, 8) 
+        self.num_vis_samples = min(total_val, 8)
 
     def forward(self, x, lang_ids, lengths):
         return self.model(x, lang_ids, lengths=lengths)
@@ -220,9 +266,28 @@ class WFLModel(pl.LightningModule):
             logits, offsets, labels, segs_gt, lengths
         )
 
-        self.log("train/loss", loss, on_step=True, on_epoch=True, prog_bar=True, batch_size=inputs.size(0))
-        self.log("train/cls_loss", cls_loss, on_step=False, on_epoch=True, batch_size=inputs.size(0))
-        self.log("train/off_loss", off_loss, on_step=False, on_epoch=True, batch_size=inputs.size(0))
+        self.log(
+            "train/loss",
+            loss,
+            on_step=True,
+            on_epoch=True,
+            prog_bar=True,
+            batch_size=inputs.size(0),
+        )
+        self.log(
+            "train/cls_loss",
+            cls_loss,
+            on_step=False,
+            on_epoch=True,
+            batch_size=inputs.size(0),
+        )
+        self.log(
+            "train/off_loss",
+            off_loss,
+            on_step=False,
+            on_epoch=True,
+            batch_size=inputs.size(0),
+        )
         return loss
 
     def on_validation_epoch_start(self):
@@ -235,18 +300,20 @@ class WFLModel(pl.LightningModule):
             if not collapsed or phone != collapsed[-1]:
                 collapsed.append(phone)
         return collapsed
-        
+
     @staticmethod
     def _edit_distance(reference, prediction):
         row = list(range(len(prediction) + 1))
         for i, ref in enumerate(reference, 1):
             next_row = [i]
             for j, pred in enumerate(prediction, 1):
-                next_row.append(min(
-                    row[j] + 1,
-                    next_row[j - 1] + 1,
-                    row[j - 1] + (ref != pred),
-                ))
+                next_row.append(
+                    min(
+                        row[j] + 1,
+                        next_row[j - 1] + 1,
+                        row[j - 1] + (ref != pred),
+                    )
+                )
             row = next_row
         return row[-1]
 
@@ -261,19 +328,34 @@ class WFLModel(pl.LightningModule):
         frame_count = int(valid.sum().item())
         if frame_count:
             acc = (logits.argmax(-1)[valid] == labels[valid]).float().mean() * 100
-            self.log("val/acc", acc, on_step=False, on_epoch=True,
-                     prog_bar=True, batch_size=frame_count)
+            self.log(
+                "val/acc",
+                acc,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=True,
+                batch_size=frame_count,
+            )
         for name, value in (
-            ("loss", loss), ("cls_loss", cls_loss), ("off_loss", off_loss)
+            ("loss", loss),
+            ("cls_loss", cls_loss),
+            ("off_loss", off_loss),
         ):
-            self.log(f"val/{name}", value, on_step=False, on_epoch=True,
-                     prog_bar=name == "loss", batch_size=inputs.size(0))
+            self.log(
+                f"val/{name}",
+                value,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=name == "loss",
+                batch_size=inputs.size(0),
+            )
 
         errors, phone_count = 0, 0
         for i, wav in enumerate(wavs):
             length = int(lengths[i].item())
             tags = viterbi_decode(
-                logits[i, :length], self.id2label,
+                logits[i, :length],
+                self.id2label,
                 viterbi_bias=self.config.get("validation", {}).get("viterbi_bias", 5),
             )
             pred_segments = continuous_segments(
@@ -282,12 +364,8 @@ class WFLModel(pl.LightningModule):
                 ),
                 len(wav) / 16000,
             )
-            reference = self._collapse_phones(
-                [ph for _, _, ph in segs_gt[i]]
-            )
-            prediction = self._collapse_phones(
-                [ph for _, _, ph in pred_segments]
-            )
+            reference = self._collapse_phones([ph for _, _, ph in segs_gt[i]])
+            prediction = self._collapse_phones([ph for _, _, ph in pred_segments])
             if (labels[i, :length] != -100).all().item():
                 errors += self._edit_distance(reference, prediction)
                 phone_count += len(reference)
@@ -299,9 +377,14 @@ class WFLModel(pl.LightningModule):
                 self.val_vis_count += 1
 
         if phone_count:
-            self.log("val/per", logits.new_tensor(100.0 * errors / phone_count),
-                     on_step=False, on_epoch=True, prog_bar=True,
-                     batch_size=phone_count)
+            self.log(
+                "val/per",
+                logits.new_tensor(100.0 * errors / phone_count),
+                on_step=False,
+                on_epoch=True,
+                prog_bar=True,
+                batch_size=phone_count,
+            )
         return loss
 
     def on_validation_epoch_end(self):
@@ -318,7 +401,8 @@ class WFLModel(pl.LightningModule):
         try:
             if self.logger:
                 self.logger.experiment.add_figure(
-                    f"val/prediction_{sample_idx}", fig,
+                    f"val/prediction_{sample_idx}",
+                    fig,
                     global_step=self.global_step,
                 )
         finally:
@@ -328,79 +412,104 @@ class WFLModel(pl.LightningModule):
         opt_name = self.config["training"].get("optimizer", "AdamW")
         lr = self.config["training"]["learning_rate"]
         decay = self.config["training"].get("weight_decay", 1e-4)
-        
+
         try:
             opt_cls = getattr(optim, opt_name)
         except AttributeError:
             opt_cls = getattr(torch.optim, opt_name)
-            
+
         optimizer = opt_cls(self.parameters(), lr=lr, weight_decay=decay)
-        
+
         step_size = self.config["training"].get("lr_decay_every_n_epochs", 10)
         scheduler = torch.optim.lr_scheduler.StepLR(
-            optimizer, 
-            step_size=step_size, 
-            gamma=self.config["training"]["lr_decay_gamma"]
+            optimizer,
+            step_size=step_size,
+            gamma=self.config["training"]["lr_decay_gamma"],
         )
         return [optimizer], [scheduler]
 
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=str, default="checkpoints_micro/config.yaml", help="Path to config file")
-    parser.add_argument("--resume", type=str, default=None, help="Path to .ckpt file to resume training from")
+    parser.add_argument(
+        "--config",
+        type=str,
+        default="checkpoints_micro/config.yaml",
+        help="Path to config file",
+    )
+    parser.add_argument(
+        "--resume",
+        type=str,
+        default=None,
+        help="Path to .ckpt file to resume training from",
+    )
     args = parser.parse_args()
 
-    with open(args.config, "r") as f: 
+    with open(args.config, "r") as f:
         config = yaml.safe_load(f)
-    
+
     pl.seed_everything(42)
 
     save_dir = config["output"]["save_dir"]
     phoneme_path = os.path.join(save_dir, "phonemes.txt")
     if not os.path.exists(phoneme_path):
-        raise FileNotFoundError(f"Phoneme list not found at {phoneme_path}. Run preprocess.py first.")
-        
+        raise FileNotFoundError(
+            f"Phoneme list not found at {phoneme_path}. Run preprocess.py first."
+        )
+
     label_list = load_phoneme_list(phoneme_path)
-    
+
     data_module = WFLDataModule(config, label_list)
-    
+
     ft_cfg = config.get("finetune", {})
     if ft_cfg.get("enabled", False) and ft_cfg.get("checkpoint_path"):
         ckpt = ft_cfg["checkpoint_path"]
         print(f"Loading weights for fine-tuning from: {ckpt}")
-        model = WFLModel.load_from_checkpoint(ckpt, config=config, label_list=label_list)
+        model = WFLModel.load_from_checkpoint(
+            ckpt, config=config, label_list=label_list
+        )
     else:
         model = WFLModel(config, label_list)
 
-    checkpoint_callback = ModelCheckpoint(
+    best_checkpoint = ModelCheckpoint(
         dirpath=save_dir,
-        filename="model-ep{epoch:02d}-{val/loss:.4f}",
+        filename="best-ep{epoch:02d}-{val/loss:.4f}",
         auto_insert_metric_name=False,
         monitor="val/loss",
         mode="min",
         save_top_k=config["training"]["max_checkpoints"],
-        save_last=True,
     )
-    
-    lr_monitor = LearningRateMonitor(logging_interval='epoch')
-    
+
+    latest_checkpoint = ModelCheckpoint(
+        dirpath=save_dir,
+        filename="latest",
+    )
+
+    lr_monitor = LearningRateMonitor(logging_interval="epoch")
+
     max_epochs = config["training"].get("max_epochs", 100)
     check_val_every_n_epoch = config["training"].get("check_val_every_n_epoch", 1)
-    
+
     trainer = pl.Trainer(
         max_epochs=max_epochs,
         check_val_every_n_epoch=check_val_every_n_epoch,
-        callbacks=[checkpoint_callback, lr_monitor],
-        logger=pl.loggers.TensorBoardLogger(save_dir=config["training"]["log_dir"], name="lightning_logs"),
+        callbacks=[best_checkpoint, latest_checkpoint, lr_monitor],
+        logger=pl.loggers.TensorBoardLogger(
+            save_dir=config["training"]["log_dir"], name="lightning_logs"
+        ),
         accelerator="auto",
         devices=1,
-        precision="32",
+        precision=config["training"].get("precision", "32"),
+        accumulate_grad_batches=config["training"].get("accumulate_grad_batches", 1),
         gradient_clip_val=1.0,
-        log_every_n_steps=10
+        log_every_n_steps=10,
     )
 
-    print(f"Starting Training for {max_epochs} epochs (Validation every {check_val_every_n_epoch} epochs)...")
+    print(
+        f"Starting Training for {max_epochs} epochs (Validation every {check_val_every_n_epoch} epochs)..."
+    )
     trainer.fit(model, data_module, ckpt_path=args.resume)
+
 
 if __name__ == "__main__":
     main()
