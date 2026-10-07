@@ -647,7 +647,10 @@ def main(
             visualize_labels=visualize_labels,
         )
 
-        if cfg.get("postprocess", {}).get("merge_segments", "right") != "none":
+        if (
+            cfg.get("postprocess", {}).get("merge_segments", "right") != "none"
+            and phones is None
+        ):
             segments = merge_adjacent_segments(
                 segments, cfg["postprocess"]["merge_segments"]
             )
