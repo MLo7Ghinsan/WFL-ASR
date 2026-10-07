@@ -125,12 +125,30 @@ def _log_softmax(x):
     return x - lse
 
 
+def forced_predict_slot(phones, forced_phones, label2id):
+    forced = []
+    for p in forced_phones or []:
+        if f"B-{p}" not in label2id or f"I-{p}" not in label2id:
+            raise ValueError(f"forced_predict_fa phoneme '{p}' is not in the moodel")
+        if p not in forced:
+            forced.append(p)
+
+    n = len(phones)
+    slots = []
+    for k in range(n + 1):
+        neighbors = {phones[k - 1] if k > 0 else None, phones[k] if k < n else None}
+        slots.append([p for p in forced if p not in neighbors])
+    return slots    
+
 def forced_align_bio(
     logits,
     id2label,
     phones,
     *,
-    allow_end_in_last_phone=True
+    allow_end_in_last_phone=True,
+    forced_pred_phones=None,
+    forced_pred_penalty=0.0
+
 ):
     x = _to_numpy_2d(logits)
     T, V = x.shape
@@ -163,7 +181,14 @@ def forced_align_bio(
     def idx_B(k): return (N + 1) + k
     def idx_I(k): return (N + 1) + N + k
 
-    S = (N + 1) + 2 * N
+    slots = forced_predict_slot(phones, forced_pred_phones, label2id)
+    opt = [(k, p) for k, slot in enumerate(slots) for p in slot]
+    S0 = (N + 1) + 2 * N
+
+    def idx_OB(j): return S0 + 2 * j
+    def idx_OI(j): return S0 + 2 * j + 1
+
+    S = S0 + 2 * len(opt)
 
     emit = np.full((T, S), -np.inf, dtype=np.float64)
     for k in range(N + 1):
@@ -171,6 +196,9 @@ def forced_align_bio(
     for k in range(N):
         emit[:, idx_B(k)] = logp[:, b_ids[k]]
         emit[:, idx_I(k)] = logp[:, i_ids[k]]
+    for j, (_, p) in enumerate(opt):
+        emit[:, idx_OB(j)] = logp[:, label2id[f"B-{p}"]] + forced_pred_penalty
+        emit[:, idx_OI(j)] = logp[:, label2id[f"I-{p}"]]
 
     trans_from = [[] for _ in range(S)]
 
@@ -190,6 +218,19 @@ def forced_align_bio(
         trans_from[idx_I(k)].append(idx_O(k + 1))
         if k + 1 < N:
             trans_from[idx_I(k)].append(idx_B(k + 1))
+
+    # forced o in gap k
+    for j, (k, _) in enumerate(opt):
+        trans_form[idx_OB(j)].append(idx_OI(j))
+        trans_form[idx_OI(j)].append(idx_OI(j))
+        trans_form[idx_O(k)].append(idx_OB(j))
+        if k > 0:
+            trans_form[idx_I(k - 1)].append(idx_OB(j))
+        for j2, (k2, _) in enumerate(opt):
+            if k2 == k and j2 != j:
+                trans_form[idx_OI(j2)].append(idx_OB(j))
+        if k < N:
+            trans_form[idx_OI(j)].append(idx_B(k))
 
     dp = np.full((T, S), -np.inf, dtype=np.float64)
     back = np.full((T, S), -1, dtype=np.int32)
@@ -212,6 +253,7 @@ def forced_align_bio(
     end_states = [idx_O(N)]
     if allow_end_in_last_phone and N > 0:
         end_states.append(idx_I(N - 1))
+        end_states.extend(idx_OI(j) for j, (k, _) in enumerate(opt) if k == N)
     end_state = max(end_states, key=lambda s: dp[T - 1, s])
 
     path = [end_state]
@@ -230,9 +272,12 @@ def forced_align_bio(
         elif s < (N + 1) + N:
             k = s - (N + 1)
             tags.append(f"B-{phones[k]}")
-        else:
+        elif s < S0:
             k = s - ((N + 1) + N)
             tags.append(f"I-{phones[k]}")
+        else:
+            j, is_inside = divmod(s - S0, 2)
+            tags.append(f"{'I' if is_inside else 'B'}-{opt[j][1]}")
     return tags
 
 

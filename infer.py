@@ -8,7 +8,7 @@ import torch
 import torchaudio
 import yaml
 from librosa.sequence import _viterbi
-from numba import bool, float64, njit, uint16
+from numba import bool, float64, njit, uint16, int32
 
 from model import BIOPhonemeTagger
 from utils import (
@@ -21,6 +21,7 @@ from utils import (
     load_phones_txt,
     merge_adjacent_segments,
     save_lab,
+    forced_predict_slot,
 )
 
 
@@ -116,67 +117,119 @@ def viterbi_decode(logits, id2label, viterbi_bias=1):
 
 
 @njit(
-    uint16[:](float64[:, :], uint16[:], bool[:], uint16[:], float64, float64, float64)
+uint16[:](float64[:, :], uint16[:], int32[:, :], float64[:, :], bool[:], bool[:])
 )
 def _forced_align_viterbi(
     log_probs,
     target_seq,
-    begin_mask,
-    optional_mask,
-    self_loop_penalty,
-    forward_penalty,
-    skip_penalty,
+    preds,
+    pred_penalty,
+    can_start,
+    can_end,
 ):
     K = len(target_seq)
     _, T = log_probs.shape
     scores = np.full((K, T), -np.inf)
     pointers = np.zeros((K, T), dtype=np.uint16)
 
-    scores[0, 0] = log_probs[target_seq[0], 0]
+    for s in range(K):
+        if can_start[s]:
+            scores[s, 0] = log_probs[target_seq[s], 0]
 
     for t in range(1, T):
         for s in range(K):
-            state_idx = target_seq[s]
+            best_score = -np.inf
+            best_prev = s
+            for j in range(preds.shape[1]):
+                prev = preds[s, j]
+                if prev < 0:
+                    break
+                cand = scores[prev, t - 1] + pred_penalty[s, j]
+                if cand > best_score:
+                    best_score = cand
+                    best_prev = prev
 
-            curr_states = np.zeros(3, dtype=np.uint16)
-            curr_scores = np.zeros(3, dtype=np.float64)
-            count = 0
-            if begin_mask[s]:
-                curr_states[count] = s
-                curr_scores[count] = -np.inf
-            else:
-                curr_states[count] = s
-                curr_scores[count] = scores[s, t - 1] + self_loop_penalty
-            count += 1
+            scores[s, t] = best_score + log_probs[target_seq[s], t]
+            pointers[s, t] = best_prev
 
-            if s > 0:
-                curr_states[count] = s - 1
-                curr_scores[count] = scores[s - 1, t - 1] + forward_penalty
-                count += 1
-
-            if s > 1 and optional_mask[s - 1] > 0:
-                curr_states[count] = s - optional_mask[s - 1] - 1
-                curr_scores[count] = (
-                    scores[s - optional_mask[s - 1] - 1, t - 1] + skip_penalty
-                )
-                count += 1
-
-            curr_states = curr_states[:count]
-            curr_scores = curr_scores[:count]
-            best_state_idx = np.argmax(curr_scores)
-
-            scores[s, t] = curr_scores[best_state_idx] + log_probs[state_idx, t]
-            pointers[s, t] = curr_states[best_state_idx]
+    end = -1
+    for s in range(K):
+        if can_end[s] and (end < 0 or scores[s, T - 1] >= scores[end, T - 1]):
+            end = s
 
     path = np.zeros(T, dtype=np.uint16)
-    path[-1] = (
-        K - 2 if optional_mask[-1] > 0 and scores[-2, -1] > scores[-1, -1] else K - 1
-    )
-
+    path[-1] = end
     for t in range(T - 2, -1, -1):
         path[t] = pointers[path[t + 1], t + 1]
 
     return path
+
+
+def build_forced_align_graph(
+    phones,
+    slots,
+    self_loop_penalty,
+    forward_penalty,
+    skip_penalty,
+    forced_penalty,
+):
+    # (forced_predict_fa) are extra nodes sitting in the gaps between the real ones.
+    labels, is_forced, real, gap_nodes = [], [], [], []
+    for k in range(len(phones) + 1):
+        gap_nodes.append([])
+        for p in slots[k]:
+            gap_nodes[k].append(len(labels))
+            labels.append(p)
+            is_forced.append(True)
+        if k < len(phones):
+            real.append(len(labels))
+            labels.append(phones[k])
+            is_forced.append(False)
+
+    in_nodes = [[] for _ in labels]
+    for k, nodes in enumerate(gap_nodes):
+        for n in nodes:
+            if k > 0:
+                in_nodes[n].append(real[k - 1])
+            in_nodes[n].extend(m for m in nodes if m != n)
+        if k < len(phones):
+            if k > 0:
+                in_nodes[real[k]].append(real[k - 1])
+            in_nodes[real[k]].extend(nodes)
+
+    K = 2 * len(labels)
+    preds = [[] for _ in range(K)]
+    for n in range(len(labels)):
+        b, i = 2 * n, 2 * n + 1
+        preds[i] = [(i, self_loop_penalty), (b, forward_penalty)]
+        extra = (
+            forced_penalty + 2 * (self_loop_penalty - forward_penalty)
+            if is_forced[n]
+            else 0.0
+        )
+        for u in in_nodes[n]:
+            preds[b].append((2 * u + 1, forward_penalty + extra))
+            preds[b].append((2 * u, skip_penalty + extra))
+
+    width = max(1, max(len(p) for p in preds))
+    pred_idx = np.full((K, width), -1, dtype=np.int32)
+    pred_pen = np.zeros((K, width), dtype=np.float64)
+    for s, items in enumerate(preds):
+        for j, (prev, pen) in enumerate(items):
+            pred_idx[s, j] = prev
+            pred_pen[s, j] = pen
+
+    can_start = np.zeros(K, dtype=np.bool_)
+    for n in gap_nodes[0] + [real[0]]:
+        can_start[2 * n] = True
+    can_end = np.zeros(K, dtype=np.bool_)
+    for n in [real[-1]] + gap_nodes[-1]:
+        can_end[2 * n : 2 * n + 2] = True
+
+    target_seq = []
+    for label in labels:
+        target_seq.extend([f"B-{label}", f"I-{label}"])
+    return target_seq, pred_idx, pred_pen, can_start, can_end
 
 
 def forced_align_viterbi(
@@ -187,6 +240,8 @@ def forced_align_viterbi(
     forward_penalty=-0.6,
     skip_penalty=-2.3,
     visualize_probabilities=False,
+    forced_pred_phones=None,
+    forced_pred_penalty=0.0
 ):
     label2id = {label: id for id, label in id2label.items()}
     # turn to log probs
@@ -195,32 +250,24 @@ def forced_align_viterbi(
     )
 
     # make target sequence
-    target_seq = []
-    begin_mask = []
-    for phn in phones:
-        target_seq.extend([f"B-{phn}", f"I-{phn}"])
-        begin_mask.extend([True, False])
+    slots = forced_predict_slot(phones, forced_pred_phones, label2id)
+    target_seq, pred_idx, pred_pen, can_start, can_end = build_forced_align_graph(
+        phones,
+        slots,
+        self_loop_penalty,
+        forward_penalty,
+        skip_penalty,
+        forced_pred_penalty,
+    )
     target_seq_idx = np.array([label2id[phn] for phn in target_seq], dtype=np.uint16)
-    begin_mask = np.array(begin_mask, dtype=np.bool)
-    optional_mask = []
-    for phn in target_seq:
-        if phn.startswith("I-"):
-            if len(optional_mask) > 0:
-                optional_mask.append(optional_mask[-1] + 1)
-            else:
-                optional_mask.append(1)
-        else:
-            optional_mask.append(0)
-    optional_mask = np.array(optional_mask, dtype=np.uint16)
 
     path = _forced_align_viterbi(
         log_probs,
         target_seq_idx,
-        begin_mask,
-        optional_mask,
-        self_loop_penalty,
-        forward_penalty,
-        skip_penalty,
+        pred_idx,
+        pred_pen,
+        can_start,
+        can_end,
     )
 
     if visualize_probabilities:
@@ -390,10 +437,21 @@ def process_audio(
         full_offsets = torch.cat(accumulated_offsets, dim=0)
 
     if phones:
+        postprocess = config.get("postprocess", {})
+        forced_align_args = postprocess.get("forced_alignment_args", {})
+        forced_predict_fa = postprocess.get("forced_predict_fa") or []
+        forced_predict_penalty = forced_align_args.get("forced_predict_penalty", 0.0)
+
+        # cleaned up a bit too
         if decoder == "constrained":
-            pred_tags = forced_align_bio(full_logits, model.id2label, phones)
+            pred_tags = forced_align_bio(
+                full_logits,
+                model.id2label,
+                phones,
+                forced_pred_phones=forced_predict_fa,
+                forced_pred_penalty=forced_predict_penalty,
+            )
         elif decoder == "viterbi":
-            forced_align_args = config["postprocess"].get("forced_alignment_args", {})
             pred_tags = forced_align_viterbi(
                 full_logits,
                 model.id2label,
@@ -402,6 +460,8 @@ def process_audio(
                 forward_penalty=forced_align_args.get("forward_penalty", -0.6),
                 skip_penalty=forced_align_args.get("skip_penalty", -2.3),
                 visualize_probabilities=visualize_probabilities,
+                forced_pred_phones=forced_predict_fa,
+                forced_pred_penalty=forced_predict_penalty,
             )
     else:
         if visualize_probabilities:
