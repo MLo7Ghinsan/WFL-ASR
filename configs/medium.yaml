@@ -11,9 +11,8 @@ model:
   encoder_type: "whisper"
   whisper_model: "openai/whisper-base"
 
-  # unfreeze last 2 layers to adapt to speaker's mic/accent
   freeze_encoder: true
-  unfreeze_last_n_layers: 2
+  unfreeze_last_n_layers: 0
 
   num_conformer_layers: 4
   conformer_heads: 4
@@ -31,9 +30,8 @@ model:
   num_languages: 0
 
 finetune:
-  enabled: true
-  checkpoint_path: "path/to/pretrained_model.ckpt"
-  freeze_backbone: false # Set to true if you only want to train the output heads
+  enabled: false
+  checkpoint_path: null
 
 training:
   batch_size: 8
