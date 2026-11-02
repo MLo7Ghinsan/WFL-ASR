@@ -24,7 +24,8 @@ from torch.utils.data import DataLoader, Dataset, Subset, random_split
 
 from infer import continuous_segments, viterbi_decode
 from model import BIOPhonemeTagger, FocalLoss
-from utils import decode_bio_tags, load_phoneme_list, visualize_prediction
+from utils import decode_bio_tags, load_phoneme_list, visualize_prediction, load_langs
+from finetune_utils import load_wfl_config, read_checkpoint, transfer_wfl_weights
 
 
 def collate_fn(batch):
@@ -205,19 +206,24 @@ class WFLDataModule(pl.LightningDataModule):
 
 
 class WFLModel(pl.LightningModule):
-    def __init__(self, config, label_list):
+    def __init__(self, config, label_list, whisper_state=None):
         super().__init__()
-        self.save_hyperparameters(ignore=["model"])
+        self.save_hyperparameters(ignore=["model", "whisper_state"])
         self.config = config
         self.label_list = label_list
         self.id2label = {i: l for i, l in enumerate(label_list)}
+    
+        self.model = BIOPhonemeTagger(config, label_list, whisper_state=whisper_state)
 
-        self.model = BIOPhonemeTagger(config, label_list)
+        ft_cfg = config.get("finetune", {})
 
-        if config.get("finetune", {}).get("freeze_backbone", False):
-            print(">>> Fine-tuning mode: Freezing Conformer backbone.")
-            for param in self.model.conformer.parameters():
-                param.requires_grad = False
+        if ft_cfg.get("enabled", False):
+            if ft_cfg.get("freeze_conformer", False):
+                self.model.conformer_layers.requires_grad_(False)
+            if ft_cfg.get("freeze_dilated_conv", False):
+                self.model.dilated_conv_stack.requires_grad_(False)
+            if ft_cfg.get("freeze_boundary_head", False):
+                self.model.boundary_offset_head.requires_grad_(False)
 
         self.criterion = FocalLoss(alpha=0.5, gamma=2.0, ignore_index=-100)
         self.offset_weight = config["model"].get("subframe_loss_weight", 5.0)
@@ -366,9 +372,8 @@ class WFLModel(pl.LightningModule):
             )
             reference = self._collapse_phones([ph for _, _, ph in segs_gt[i]])
             prediction = self._collapse_phones([ph for _, _, ph in pred_segments])
-            if (labels[i, :length] != -100).all().item():
-                errors += self._edit_distance(reference, prediction)
-                phone_count += len(reference)
+            errors += self._edit_distance(reference, prediction)
+            phone_count += len(reference)
 
             if self.val_vis_count < self.num_vis_samples:
                 self._log_visualization(
@@ -408,6 +413,17 @@ class WFLModel(pl.LightningModule):
         finally:
             plt.close(fig)
 
+    def on_save_checkpoint(self, checkpoint):
+        checkpoint["wfl_labels"] = list(self.label_list)
+
+        lang_path = os.path.join(
+            self.config["output"]["save_dir"],
+            "langs.txt",
+        )
+
+        if os.path.exists(lang_path):
+            checkpoint["wfl_lang2id"] = load_langs(lang_path)
+            
     def configure_optimizers(self):
         opt_name = self.config["training"].get("optimizer", "AdamW")
         lr = self.config["training"]["learning_rate"]
@@ -418,7 +434,49 @@ class WFLModel(pl.LightningModule):
         except AttributeError:
             opt_cls = getattr(torch.optim, opt_name)
 
-        optimizer = opt_cls(self.parameters(), lr=lr, weight_decay=decay)
+        ft_cfg = self.config.get("finetune", {})
+
+        if ft_cfg.get("enabled", False):
+            rates = ft_cfg.get("learning_rates", {})
+            groups = []
+
+            def add_group(module, name):
+                params = [
+                    p for p in module.parameters()
+                    if p.requires_grad
+                ]
+
+                if params:
+                    groups.append({
+                        "params": params,
+                        "lr": float(rates.get(name, lr)),
+                    })
+
+            add_group(self.model.classifier, "classifier")
+            add_group(self.model.lang_emb, "language_embeddings")
+            add_group(self.model.lang_proj, "language_projection")
+
+            add_group(self.model.conformer_layers, "acoustic_stack")
+            add_group(self.model.dilated_conv_stack, "acoustic_stack")
+            add_group(self.model.boundary_offset_head, "boundary_head")
+
+            if hasattr(self.model, "layer_weights"):
+                groups.append({
+                    "params": [self.model.layer_weights],
+                    "lr": float(rates.get("layer_mixing", lr)),
+                })
+
+            optimizer = opt_cls(
+                groups,
+                weight_decay=decay,
+            )
+
+        else:
+            optimizer = opt_cls(
+                (p for p in self.parameters() if p.requires_grad),
+                lr=lr,
+                weight_decay=decay,
+            )
 
         step_size = self.config["training"].get("lr_decay_every_n_epochs", 10)
         scheduler = torch.optim.lr_scheduler.StepLR(
@@ -445,8 +503,7 @@ def main():
     )
     args = parser.parse_args()
 
-    with open(args.config, "r") as f:
-        config = yaml.safe_load(f)
+    config = load_wfl_config(args.config)
 
     pl.seed_everything(42)
 
@@ -462,12 +519,35 @@ def main():
     data_module = WFLDataModule(config, label_list)
 
     ft_cfg = config.get("finetune", {})
-    if ft_cfg.get("enabled", False) and ft_cfg.get("checkpoint_path"):
-        ckpt = ft_cfg["checkpoint_path"]
-        print(f"Loading weights for fine-tuning from: {ckpt}")
-        model = WFLModel.load_from_checkpoint(
-            ckpt, config=config, label_list=label_list
+
+    if ft_cfg.get("enabled", False):
+        if args.resume:
+            raise ValueError(
+                "Use either fine-tuning or --resume, not both."
+            )
+
+        source_path = ft_cfg["checkpoint_path"]
+        print(f"Fine-tuning WFL from: {source_path}")
+
+        source_ckpt = read_checkpoint(source_path)
+        source_state = source_ckpt["state_dict"]
+
+        model = WFLModel(
+            config,
+            label_list,
+            whisper_state=source_state,
         )
+
+        transfer_wfl_weights(
+            model,
+            source_ckpt,
+            source_path,
+            save_dir,
+            label_list,
+        )
+
+        del source_ckpt, source_state
+
     else:
         model = WFLModel(config, label_list)
 
