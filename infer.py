@@ -651,28 +651,45 @@ def main(
             lang_name = id2lang.get(lang_id)
             print(f"Language: {lang_name} (ID: {lang_id})")
 
-    print("Loading model...")
-    model = BIOPhonemeTagger(cfg, labels).to(device)
-    model.eval()
+    print("Loading WFL checkpoint...")
 
-    # weights_only=False because I dont like the the 'untrusted-models' warning
-    checkpoint_data = torch.load(checkpoint, map_location=device, weights_only=False)
-    state_dict = (
-        checkpoint_data["state_dict"]
-        if "state_dict" in checkpoint_data
-        else checkpoint_data
+    checkpoint_data = torch.load(
+        checkpoint,
+        map_location="cpu",
+        weights_only=True,
     )
 
-    new_state_dict = {}
-    for k, v in state_dict.items():
-        if k.startswith("model."):
-            new_state_dict[k[6:]] = v
+    state_dict = checkpoint_data.get(
+        "state_dict",
+        checkpoint_data,
+    )
+
+    new_state_dict = {
+        k[6:]: v
+        for k, v in state_dict.items()
+        if k.startswith("model.")
+    }
+
+    if not new_state_dict:
+        raise ValueError(
+            "No WFL model weights found in checkpoint"
+        )
+
+    # No more whisper download lmao
+    model = BIOPhonemeTagger(
+        cfg,
+        labels,
+        whisper_state=new_state_dict,
+    ).to(device)
 
     try:
-        model.load_state_dict(new_state_dict)
+        model.load_state_dict(new_state_dict, strict=True)
     except RuntimeError as e:
         print(f"Error loading weights: {e}")
         return
+
+    model.eval()
+    del checkpoint_data, state_dict, new_state_dict
 
     files = collect_wavs(input_path)
     print(f"Found {len(files)} files.")
