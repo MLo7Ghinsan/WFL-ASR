@@ -529,7 +529,7 @@ def process_audio(
 @click.option(
     "--config",
     "-c",
-    default="checkpoints_no_env/config.yaml",
+    default=None,
     help="Path to config file",
 )
 @click.option(
@@ -601,6 +601,27 @@ def main(
     visualize_probabilities,
     visualize_labels,
 ):
+    checkpoint_dir = os.path.dirname(os.path.abspath(checkpoint))
+
+    if config is None:
+        yaml_files = sorted(
+            f for f in os.listdir(checkpoint_dir)
+            if f.lower().endswith((".yaml"))
+        )
+
+        if not yaml_files:
+            raise FileNotFoundError(
+                f"No YAML config found in {checkpoint_dir}"
+            )
+
+        if len(yaml_files) > 1:
+            raise ValueError(
+                f"Multiple YAML configs found: {yaml_files}. "
+                "Please specify one with --config."
+            )
+
+        config = os.path.join(checkpoint_dir, yaml_files[0])
+
     cfg = load_config(config)
     device = (
         "cuda"
@@ -611,7 +632,7 @@ def main(
     )
     print(f"Running on: {device}")
 
-    save_dir = cfg["output"]["save_dir"]
+    save_dir = checkpoint_dir
     phonemes_path = os.path.join(save_dir, "phonemes.txt")
 
     if not os.path.exists(phonemes_path):
