@@ -5,7 +5,58 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchaudio
 from transformers import WhisperFeatureExtractor, WhisperModel
+from transformers.models.whisper.modeling_whisper import WhisperEncoder
 
+def whisper_config_from_state(state):
+    if "model.encoder.conv1.weight" in state:
+        prefix = "model.encoder."
+    elif "encoder.conv1.weight" in state:
+        prefix = "encoder."
+    else:
+        raise ValueError("WFL checkpoint has no Whisper encoder weights.")
+
+    conv = state[prefix + "conv1.weight"]
+    hidden_size = conv.shape[0]
+    n_mels = conv.shape[1]
+
+    # atandard Whisper attention-head config
+    heads = {
+        384: 6,
+        512: 8,
+        768: 12,
+        1024: 16,
+        1280: 20,
+    }.get(hidden_size)
+
+    if heads is None:
+        raise ValueError(
+            f"Unknown Whisper hidden dimension: {hidden_size}"
+        )
+
+    layer_prefix = prefix + "layers."
+    layer_ids = {
+        int(k[len(layer_prefix):].split(".")[0])
+        for k in state
+        if k.startswith(layer_prefix)
+        and k[len(layer_prefix):].split(".")[0].isdigit()
+    }
+
+    if not layer_ids or layer_ids != set(range(len(layer_ids))):
+        raise ValueError("invalid Whisper encoder layer indices")
+
+    return WhisperConfig(
+        d_model=hidden_size,
+        num_mel_bins=n_mels,
+        encoder_layers=len(layer_ids),
+        encoder_attention_heads=heads,
+        encoder_ffn_dim=state[
+            prefix + "layers.0.fc1.weight"
+        ].shape[0],
+        max_source_positions=state[
+            prefix + "embed_positions.weight"
+        ].shape[0],
+    )
+    
 def masked_conv(stack, x, valid):
     mask = valid.unsqueeze(1)
     x = x.masked_fill(~mask, 0)
@@ -136,26 +187,31 @@ class ConformerBlock(nn.Module):
         return (x + 0.5 * self.ff2(x)).masked_fill(~mask, 0)
 
 class BIOPhonemeTagger(nn.Module):
-    def __init__(self, config, label_list):
+    def __init__(self, config, label_list, whisper_state=None):
         super().__init__()
         self.config = config
         self.encoder_type = config["model"].get("encoder_type", "whisper").lower()
         model_name = config["model"].get("whisper_model", "openai/whisper-base")
 
-        encoder_dir = os.path.join(os.getcwd(), "encoder")
-
         if self.encoder_type == "whisper":
-            if not os.path.exists(encoder_dir) or not os.listdir(encoder_dir):
-                print(f"Downloading Whisper ({model_name}) to local directory: {encoder_dir} ...")
-                os.makedirs(encoder_dir, exist_ok=True)
-                ext = WhisperFeatureExtractor.from_pretrained(model_name)
-                mod = WhisperModel.from_pretrained(model_name)
-                ext.save_pretrained(encoder_dir)
-                mod.save_pretrained(encoder_dir)
-                del mod 
-            
-            self.feature_extractor = WhisperFeatureExtractor.from_pretrained(encoder_dir)
-            self.encoder = WhisperModel.from_pretrained(encoder_dir).encoder
+            if whisper_state is not None:
+                encoder_config = whisper_config_from_state(whisper_state)
+                self.feature_extractor = WhisperFeatureExtractor(feature_size=encoder_config.num_mel_bins)
+                self.encoder = WhisperEncoder(encoder_config)
+            else:
+                encoder_dir = os.path.join(os.getcwd(), "encoder")
+                if not os.path.exists(encoder_dir) or not os.listdir(encoder_dir):
+                    print(f"Downloading Whisper ({model_name})...")
+                    os.makedirs(encoder_dir, exist_ok=True)
+                    ext = WhisperFeatureExtractor.from_pretrained(model_name)
+                    mod = WhisperModel.from_pretrained(model_name)
+                    ext.save_pretrained(encoder_dir)
+                    mod.save_pretrained(encoder_dir)
+                    del mod
+
+                self.feature_extractor = WhisperFeatureExtractor.from_pretrained(encoder_dir)
+                self.encoder = WhisperModel.from_pretrained(encoder_dir).encoder
+
             hidden_size = self.encoder.config.d_model
             self.layer_weights = nn.Parameter(torch.zeros(len(self.encoder.layers) + 1))
         else:
@@ -172,17 +228,10 @@ class BIOPhonemeTagger(nn.Module):
         self.lang_emb = nn.Embedding(config["model"]["num_languages"], self.lang_emb_dim)
         self.lang_proj = nn.Linear(hidden_size + self.lang_emb_dim, hidden_size)
 
-        if self.encoder:
-            if config["model"].get("freeze_encoder", False):
-                for param in self.encoder.parameters():
-                    param.requires_grad = False
-                
-                unfreeze_n = config["model"].get("unfreeze_last_n_layers", 0)
-                if unfreeze_n > 0:
-                    if hasattr(self.encoder, "layers"): 
-                        for layer in self.encoder.layers[-unfreeze_n:]:
-                            for param in layer.parameters():
-                                param.requires_grad = True
+        # i'm disabling whisper finetuning since it's no good </3
+        if self.encoder is not None:
+            self.encoder.requires_grad_(False)
+            self.encoder.eval()
 
         self.spec_aug = SpecAugment()
         
@@ -222,6 +271,12 @@ class BIOPhonemeTagger(nn.Module):
         self.label2id = {label: i for i, label in enumerate(label_list)}
         self.id2label = {i: label for label, i in self.label2id.items()}
 
+    def train(self, mode=True): # dropout prevention
+        super().train(mode)
+        if self.encoder is not None:
+            self.encoder.eval()
+        return self
+        
     def forward(self, input_values, lang_id=None, max_label_len=None, lengths=None):
         if self.encoder_type == "whisper":
             features = self.feature_extractor(
@@ -229,9 +284,12 @@ class BIOPhonemeTagger(nn.Module):
                 return_tensors="pt",
             )
             input_features = features["input_features"].to(input_values.device)
-            encoder_out = self.encoder(
-                input_features, output_hidden_states=True, return_dict=True
-            )
+            with torch.no_grad():
+                encoder_out = self.encoder(
+                    input_features,
+                    output_hidden_states=True,
+                    return_dict=True
+                )
             weights = self.layer_weights.softmax(dim=0)
             hidden_states = sum(
                 weight.to(state.dtype) * F.layer_norm(state, (state.size(-1),))
