@@ -5,9 +5,11 @@ finetune:
   checkpoint_path: "../checkpoints_source/best.ckpt"
 
   # Preserve WFL's learned acoustic representations initially
-  freeze_conformer: true
-  freeze_dilated_conv: true
-  freeze_boundary_head: true
+  # If finetuning from existing speaker and same language, i'd turn these two to true
+  freeze_conformer: false
+  freeze_dilated_conv: false
+  # this one is for the boundary timing refinement, freezing or not is debatable. Default as not frozen
+  freeze_boundary_head: false
 
   learning_rates:
     classifier: 0.0005
