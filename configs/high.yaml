@@ -11,9 +11,8 @@ model:
   encoder_type: "whisper"
   whisper_model: "openai/whisper-base"
 
-  # unfreeze almost half the encoder for deep finetuning
   freeze_encoder: true
-  unfreeze_last_n_layers: 6
+  unfreeze_last_n_layers: 0
 
   num_conformer_layers: 6
   conformer_heads: 8
@@ -31,9 +30,8 @@ model:
   num_languages: 0
 
 finetune:
-  enabled: true
-  checkpoint_path: "path/to/pretrained_model.ckpt"
-  freeze_backbone: false # Set to true if you only want to train the output heads
+  enabled: false
+  checkpoint_path: null
 
 training:
   batch_size: 16
