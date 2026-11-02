@@ -6,9 +6,10 @@ import math
 import soundfile as sf
 from tqdm import tqdm
 import argparse
+from finetune_utils import load_wfl_config
 
 def load_config(path="config.yaml"):
-    with open(path, "r") as f: return yaml.safe_load(f)
+    return load_wfl_config(path)
 
 def to_bio_tags(phonemes, num_frames, frame_duration, audio_duration):
     if not phonemes or num_frames < 1:
