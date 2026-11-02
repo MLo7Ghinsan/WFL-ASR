@@ -1,0 +1,34 @@
+finetune:
+  enabled: true
+
+  # WFL checkpoint, not a Hugging Face Whisper checkpoint!
+  checkpoint_path: "../checkpoints_source/best.ckpt"
+
+  # Preserve WFL's learned acoustic representations initially
+  freeze_conformer: true
+  freeze_dilated_conv: true
+  freeze_boundary_head: true
+
+  learning_rates:
+    classifier: 0.0005
+    language_embeddings: 0.0002
+    language_projection: 0.00002
+    layer_mixing: 0.00001
+    acoustic_stack: 0.00002
+    boundary_head: 0.00002
+
+data:
+  data_dir: "training_dataset_"
+  num_val_files: 6
+
+training:
+  batch_size: 4
+  num_workers: 2
+  max_epochs: 100
+  check_val_every_n_epoch: 1
+  learning_rate: 0.00005
+  log_dir: "logs/finetune"
+  merged_phoneme_groups: []
+
+output:
+  save_dir: "checkpoints_finetuned"
