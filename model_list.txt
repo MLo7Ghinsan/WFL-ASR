@@ -1,0 +1,9 @@
+Whisper:
+openai/whisper-tiny
+openai/whisper-base
+openai/whisper-small
+openai/whisper-medium
+openai/whisper-large
+openai/whisper-large-v2
+openai/whisper-large-v3
+openai/whisper-large-v3-turbo

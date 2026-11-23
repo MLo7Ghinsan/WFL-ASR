@@ -1,174 +1,136 @@
 import os
 import glob
+import json
+import yaml
+import math
 import soundfile as sf
 from tqdm import tqdm
-import yaml
-import json
+import argparse
+from finetune_utils import load_wfl_config
 
 def load_config(path="config.yaml"):
-    with open(path, "r") as f:
-        return yaml.safe_load(f)
+    return load_wfl_config(path)
 
-def parse_lab(lab_path):
-    phonemes = []
-    with open(lab_path, "r", encoding="utf-8") as f:
-        for line_num, line in enumerate(f, 1):
-            parts = line.strip().split()
+def to_bio_tags(phonemes, num_frames, frame_duration, audio_duration):
+    if not phonemes or num_frames < 1:
+        raise ValueError("Empty labels or audio.")
 
-            if len(parts) != 3:
-                print(f"[WARN] Skipping malformed line {line_num} in {lab_path}: {line.strip()}")
+    tags = ["O"] * num_frames
+    previous_end = 0.0
+
+    for start, end, ph in phonemes:
+        if not 0 <= start < end <= audio_duration + 1e-7:
+            raise ValueError(f"Invalid timestamps: {start} {end} {ph}")
+        if start < previous_end:
+            raise ValueError(f"Overlapping phoneme: {ph}")
+
+        s_idx = int(start / frame_duration)
+        e_idx = min(int(end / frame_duration), num_frames - 1)
+
+        tags[s_idx] = f"B-{ph}"
+        for i in range(s_idx + 1, e_idx + 1):
+            tags[i] = f"I-{ph}"
+
+        previous_end = end
+
+    return tags
+
+def preprocess(data_dir, config):
+    frame_dur = config["data"].get("frame_duration", 0.02)
+    save_dir = config["output"]["save_dir"]
+    os.makedirs(save_dir, exist_ok=True)
+    
+    # lang map
+    lang_dirs = sorted([d for d in os.listdir(data_dir) if os.path.isdir(os.path.join(data_dir, d))])
+    lang2id = {l: i for i, l in enumerate(lang_dirs)}
+    
+    # phoneme merging map
+    merge_map, reverse_map = {}, {}
+    for group in config.get("training", {}).get("merged_phoneme_groups", []):
+        canon = group[0]
+        for item in group[1:]:
+            if "/" in item:
+                l, p = item.split("/", 1)
+                merge_map.setdefault(l, {})[p] = canon
+                reverse_map.setdefault(canon, {})[l] = p
+
+    dataset, phoneme_set = [], set()
+    lang_phonemes = {lang: set() for lang in lang_dirs} # tracking...
+    
+    for lang in lang_dirs:
+        wavs = glob.glob(os.path.join(data_dir, lang, "*.wav"))
+        for wav in tqdm(wavs, desc=lang):
+            lab = wav.replace(".wav", ".lab")
+            if not os.path.exists(lab): continue
+            
+            # read audio
+            try:
+                with sf.SoundFile(wav) as f:
+                    dur = len(f) / f.samplerate
+                num_frames = math.ceil(dur / frame_dur)
+            except Exception as e:
+                print(f"[ERROR] Could not read {wav}: {e}")
+                continue
+            
+            # parse Lab
+            segs = []
+            with open(lab, "r", encoding="utf-8") as lf:
+                for line_number, line in enumerate(lf, 1):
+                    p = line.strip().split()
+                    if not p:
+                        continue
+                    if len(p) != 3:
+                        raise ValueError(f"{lab}:{line_number}: Invalid label line")
+                    ph = p[2]
+                    # merge
+                    ph = merge_map.get(lang, {}).get(ph, ph)
+                    start, end = float(p[0]) / 1e7, float(p[1]) / 1e7
+                    if start == end or start >= dur:
+                        continue
+                    end = min(end, dur)
+                    segs.append((start, end, ph))
+                    phoneme_set.add(ph)
+                    lang_phonemes[lang].add(ph)
+            
+            if not segs or num_frames < 1:
+                print(f"[SKIP] No usable labels or audio: {lab}")
                 continue
 
             try:
-                start = int(parts[0]) / 1e7
-                end = int(parts[1]) / 1e7
-                ph = parts[2]
-                phonemes.append((start, end, ph))
-            except Exception as e:
-                print(f"[ERROR] Failed to parse line {line_num} in {lab_path}: {e}")
+                tags = to_bio_tags(segs, num_frames, frame_dur, dur)
+            except ValueError as e:
+                print(f"[SKIP] {lab}: {e}")
                 continue
+            dataset.append({
+                "wav_path": wav, "bio_tags": tags, 
+                "phoneme_segments": segs, "lang_id": lang2id[lang]
+            })
 
-    return phonemes
+    # save paths
+    dataset_path = os.path.join(save_dir, "dataset.json")
+    langs_path = os.path.join(save_dir, "langs.txt")
+    phonemes_path = os.path.join(save_dir, "phonemes.txt")
+    lang_phonemes_path = os.path.join(save_dir, "lang_phonemes.json")
+    merge_map_path = os.path.join(save_dir, "phoneme_merge_map.json")
+    config_path = os.path.join(save_dir, "config.yaml")
 
-def to_bio_tags(phonemes, num_frames, frame_duration):
-    tags = ["O"] * num_frames
-    for start, end, ph in phonemes:
-        start_idx = int(start / frame_duration)
-        end_idx = int(end / frame_duration)
-        if end_idx >= num_frames:
-            end_idx = num_frames - 1
-        if start_idx >= num_frames:
-            continue
-        tags[start_idx] = f"B-{ph}"
-        for i in range(start_idx + 1, end_idx + 1):
-            if i < num_frames:
-                tags[i] = f"I-{ph}"
-    return tags
-
-def build_merge_map(groups):
-    merge_map = {}
-    reverse_map = {}
-    for group in groups or []:
-        if not isinstance(group, (list, tuple)) or len(group) < 2:
-            continue
-        canonical = group[0]
-        if "/" in canonical:
-            _, canonical_ph = canonical.split("/", 1)
-            items = group
-        else:
-            canonical_ph = canonical
-            items = group[1:]
-        for item in items:
-            if "/" not in item:
-                continue
-            lang, ph = item.split("/", 1)
-            merge_map.setdefault(lang, {})[ph] = canonical_ph
-            reverse_map.setdefault(canonical_ph, {})[lang] = ph
-    return merge_map, reverse_map
+    # save files
+    with open(dataset_path, "w") as f: json.dump(dataset, f, indent=2)
     
-def preprocess(data_dir, config):
-    frame_duration = config["data"].get("frame_duration", 0.02)
-    all_lang_dirs = sorted([d for d in os.listdir(data_dir) if os.path.isdir(os.path.join(data_dir, d))])
-    merge_map, reverse_map = build_merge_map(config.get("training", {}).get("merged_phoneme_groups", []))
-    save_dir = config["output"]["save_dir"]
-    existing_lang2id = {}
-    existing_phonemes = set()
+    with open(langs_path, "w", encoding="utf-8") as f:
+        for l, i in lang2id.items(): f.write(f"{l},{i}\n")
+    
+    all_tags = sorted(["O"] + [f"B-{p}" for p in phoneme_set] + [f"I-{p}" for p in phoneme_set])
+    with open(phonemes_path, "w", encoding="utf-8") as f: f.write("\n".join(all_tags))
 
-    langs_txt_path = os.path.join(save_dir, "langs.txt")
-    phonemes_txt_path = os.path.join(save_dir, "phonemes.txt")
-
-    if os.path.exists(langs_txt_path):
-        with open(langs_txt_path, "r", encoding="utf-8") as f:
-            for line in f:
-                parts = line.strip().split(",")
-                if len(parts) == 2:
-                    lang, idx = parts
-                    existing_lang2id[lang] = int(idx)
-
-    if os.path.exists(phonemes_txt_path):
-        with open(phonemes_txt_path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line and line != "O":
-                    if line.startswith("B-") or line.startswith("I-"):
-                        existing_phonemes.add(line[2:])
-
-    lang2id = dict(existing_lang2id)
-    next_lang_id = max(lang2id.values(), default=-1) + 1
-    for lang in all_lang_dirs:
-        if lang not in lang2id:
-            lang2id[lang] = next_lang_id
-            next_lang_id += 1
-
-    dataset = []
-    phoneme_set = set()
-    lang_phonemes = {}
-
-    for lang in all_lang_dirs:
-        lang_path = os.path.join(data_dir, lang)
-        wav_files = sorted(glob.glob(os.path.join(lang_path, "*.wav")))
-        lang_phonemes[lang] = set()
-
-        for wav_path in tqdm(wav_files, desc=f"[{lang}]"):
-            base = os.path.splitext(os.path.basename(wav_path))[0]
-            lab_path = os.path.join(lang_path, base + ".lab")
-
-            if not os.path.exists(lab_path):
-                print(f"Missing label for {base}, skipping.")
-                continue
-
-            audio, sr = sf.read(wav_path)
-            duration = len(audio) / sr
-            num_frames = int(duration / frame_duration)
-
-            phoneme_segments_raw = parse_lab(lab_path)
-            phoneme_segments = []
-            for start, end, ph in phoneme_segments_raw:
-                merged_ph = merge_map.get(lang, {}).get(ph, ph)
-                phoneme_segments.append((start, end, merged_ph))
-                phoneme_set.add(merged_ph)
-                lang_phonemes[lang].add(merged_ph)
-
-            bio_tags = to_bio_tags(phoneme_segments, num_frames, frame_duration)
-
-            sample = {
-                "wav_path": wav_path,
-                "bio_tags": bio_tags,
-                "phoneme_segments": phoneme_segments,
-                "lang_id": lang2id[lang]
-            }
-            dataset.append(sample)
-
-    save_dir = config["output"]["save_dir"]
-    os.makedirs(save_dir, exist_ok=True)
-
-    dataset_json_path = os.path.join(save_dir, "dataset.json")
-    with open(dataset_json_path, "w") as f:
-        json.dump(dataset, f, indent=2)
-
-    lang_phonemes_json_path = os.path.join(save_dir, "lang_phonemes.json")
-    with open(lang_phonemes_json_path, "w", encoding="utf-8") as f:
+    with open(lang_phonemes_path, "w", encoding="utf-8") as f:
         json.dump({k: sorted(list(v)) for k, v in lang_phonemes.items()}, f, indent=2, ensure_ascii=False)
-
+    
     if reverse_map:
-        merge_map_path = os.path.join(save_dir, "phoneme_merge_map.json")
-        with open(merge_map_path, "w", encoding="utf-8") as f:
-            json.dump(reverse_map, f, indent=2, ensure_ascii=False)
-        
-    merged_phonemes = set(existing_phonemes).union(phoneme_set)
-    all_tags = {f"B-{ph}" for ph in merged_phonemes}
-    all_tags.update({f"I-{ph}" for ph in merged_phonemes})
-    all_tags.add("O")
+        with open(merge_map_path, "w", encoding="utf-8") as f: json.dump(reverse_map, f, indent=2, ensure_ascii=False)
 
-    phoneme_txt_path = os.path.join(save_dir, "phonemes.txt")
-    with open(phoneme_txt_path, "w", encoding="utf-8") as f:
-        for tag in sorted(all_tags):
-            f.write(f"{tag}\n")
-
-    langs_txt_path = os.path.join(save_dir, "langs.txt")
-    with open(langs_txt_path, "w", encoding="utf-8") as f:
-        for lang, idx in lang2id.items():
-            f.write(f"{lang},{idx}\n")
+    config["model"]["num_languages"] = len(lang2id)
+    with open(config_path, "w") as f: yaml.dump(config, f, sort_keys=False)
 
     if merge_map:
         print("\nApplied merged phoneme groups:")
@@ -177,23 +139,28 @@ def preprocess(data_dir, config):
                 print(f"  {lang}/{src} -> {tgt}")
 
     print(f"\nProcessed {len(dataset)} samples.")
-    print(f"\nGenerated {len(all_tags)} BIO labels -> {phoneme_txt_path}")
-    print(f"\nSaved language mapping -> {langs_txt_path}")
-    print(f"\nSaved language phoneme list -> {lang_phonemes_json_path}")
+    print(f"\nGenerated {len(all_tags)} labels -> {phonemes_path}")
+    print(f"\nSaved language mapping -> {langs_path}")
+    print(f"\nSaved language phoneme list -> {lang_phonemes_path}")
     if reverse_map:
         print(f"\nSaved phoneme merge map -> {merge_map_path}")
-
+    
     print("\nPhoneme usage by language:")
     for lang, phonemes in lang_phonemes.items():
         sorted_phs = sorted(list(phonemes))
         print(f"  {lang}: {sorted_phs}")
-
-    config["model"]["num_languages"] = len(lang2id)
-    updated_config_path = os.path.join(save_dir, "config.yaml")
-    with open(updated_config_path, "w") as f:
-        yaml.dump(config, f, sort_keys=False)
-    print(f"\nSaved updated config -> {updated_config_path}")
+        
+    print(f"\nSaved updated config -> {config_path}")
 
 if __name__ == "__main__":
-    config = load_config()
+    parser = argparse.ArgumentParser(description="Preprocess dataset for WFL-ASR")
+    parser.add_argument("--config", type=str, default="configs/small.yaml", help="Path to config file")
+    args = parser.parse_args()
+
+    if not os.path.exists(args.config):
+        print(f"Error: Config file '{args.config}' not found.")
+        exit(1)
+
+    print(f"Using config: {args.config}")
+    config = load_config(args.config)
     preprocess(config["data"]["data_dir"], config)

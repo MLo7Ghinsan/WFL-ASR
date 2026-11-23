@@ -1,7 +1,144 @@
+import os
+import math
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torchaudio
-from transformers import WhisperFeatureExtractor, WhisperModel, WavLMModel, WavLMConfig, Wav2Vec2FeatureExtractor
+from transformers import WhisperFeatureExtractor, WhisperModel
+from transformers.models.whisper.modeling_whisper import WhisperEncoder
+
+def whisper_config_from_state(state):
+    if "model.encoder.conv1.weight" in state:
+        prefix = "model.encoder."
+    elif "encoder.conv1.weight" in state:
+        prefix = "encoder."
+    else:
+        raise ValueError("WFL checkpoint has no Whisper encoder weights.")
+
+    conv = state[prefix + "conv1.weight"]
+    hidden_size = conv.shape[0]
+    n_mels = conv.shape[1]
+
+    # atandard Whisper attention-head config
+    heads = {
+        384: 6,
+        512: 8,
+        768: 12,
+        1024: 16,
+        1280: 20,
+    }.get(hidden_size)
+
+    if heads is None:
+        raise ValueError(
+            f"Unknown Whisper hidden dimension: {hidden_size}"
+        )
+
+    layer_prefix = prefix + "layers."
+    layer_ids = {
+        int(k[len(layer_prefix):].split(".")[0])
+        for k in state
+        if k.startswith(layer_prefix)
+        and k[len(layer_prefix):].split(".")[0].isdigit()
+    }
+
+    if not layer_ids or layer_ids != set(range(len(layer_ids))):
+        raise ValueError("invalid Whisper encoder layer indices")
+
+    return WhisperConfig(
+        d_model=hidden_size,
+        num_mel_bins=n_mels,
+        encoder_layers=len(layer_ids),
+        encoder_attention_heads=heads,
+        encoder_ffn_dim=state[
+            prefix + "layers.0.fc1.weight"
+        ].shape[0],
+        max_source_positions=state[
+            prefix + "embed_positions.weight"
+        ].shape[0],
+    )
+    
+def masked_conv(stack, x, valid):
+    mask = valid.unsqueeze(1)
+    x = x.masked_fill(~mask, 0)
+    layers = stack if isinstance(stack, nn.Sequential) else [stack]
+
+    for layer in layers:
+        if isinstance(layer, nn.BatchNorm1d):
+            values = x.transpose(1, 2)[valid]
+            if layer.training and values.size(0) == 1:
+                values = F.batch_norm(
+                    values, layer.running_mean, layer.running_var,
+                    layer.weight, layer.bias, training=False, eps=layer.eps,
+                )
+            else:
+                values = layer(values)
+            out = x.new_zeros(x.size(0), x.size(2), x.size(1))
+            out[valid] = values.to(x.dtype)
+            x = out.transpose(1, 2)
+        else:
+            x = layer(x)
+        x = x.masked_fill(~mask, 0)
+
+    return x
+    
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=0.25, gamma=2.0, ignore_index=-100):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.ignore_index = ignore_index
+        self.ce = nn.CrossEntropyLoss(ignore_index=ignore_index, reduction='none')
+
+    def forward(self, logits, targets):
+        valid = targets != self.ignore_index
+        ce = self.ce(logits.float(), targets)
+        pt = torch.exp(-ce).clamp(min=1e-8, max=1.0 - 1e-8)
+        loss = self.alpha * (1 - pt) ** self.gamma * ce
+        return loss[valid].sum() / valid.sum().clamp_min(1)
+
+class SpecAugment(nn.Module):
+    def __init__(self, freq_mask_param=20, time_mask_param=30):
+        super().__init__()
+        self.freq_mask_param = freq_mask_param
+        self.time_mask_param = time_mask_param
+
+    def forward(self, x, lengths):
+        if not self.training:
+            return x
+
+        batch, frames, channels = x.shape
+        lengths = lengths.to(device=x.device, dtype=torch.long)
+        time_limit = (lengths // 5).clamp(max=self.time_mask_param)
+        time_width = (torch.rand(batch, device=x.device) * (time_limit + 1)).long()
+        time_start = (
+            torch.rand(batch, device=x.device) * (lengths - time_width + 1)
+        ).long()
+
+        feature_limit = min(self.freq_mask_param, channels - 1)
+        feature_width = torch.randint(
+            feature_limit + 1, (batch,), device=x.device
+        )
+        feature_start = (
+            torch.rand(batch, device=x.device) * (channels - feature_width + 1)
+        ).long()
+
+        t = torch.arange(frames, device=x.device)[None, :]
+        c = torch.arange(channels, device=x.device)[None, :]
+        time_mask = (t >= time_start[:, None]) & (
+            t < (time_start + time_width)[:, None]
+        )
+        feature_mask = (c >= feature_start[:, None]) & (
+            c < (feature_start + feature_width)[:, None]
+        )
+        mask = torch.logical_or(
+            time_mask[:, :, None],
+            feature_mask[:, None, :],
+        )
+        mask = torch.logical_or(
+            mask,
+            (t >= lengths[:, None])[:, :, None],
+        )
+        return x.masked_fill(mask, 0)
 
 class FeedForwardModule(nn.Module):
     def __init__(self, dim, expansion=4, dropout=0.1):
@@ -26,7 +163,6 @@ class ConformerBlock(nn.Module):
         self.self_attn = nn.MultiheadAttention(embed_dim=dim, num_heads=heads, dropout=dropout, batch_first=True)
         self.ln1 = nn.LayerNorm(dim)
         self.ln2 = nn.LayerNorm(dim)
-
         self.conv = nn.Sequential(
             nn.Conv1d(dim, 2 * dim, kernel_size=1),
             nn.GLU(dim=1),
@@ -37,81 +173,68 @@ class ConformerBlock(nn.Module):
             nn.Dropout(dropout)
         )
 
-    def forward(self, x):
-        x = x + 0.5 * self.ff1(x)
-        attn_out, _ = self.self_attn(x, x, x)
-        x = self.ln1(x + attn_out)
-        x_ln = self.ln2(x)
-        x_conv = self.conv(x_ln.transpose(1, 2)).transpose(1, 2)
-        if x.size(1) != x_conv.size(1):
-            min_len = min(x.size(1), x_conv.size(1))
-            x = x[:, :min_len]
-            x_conv = x_conv[:, :min_len]
-        x = x + x_conv
-        x = x + 0.5 * self.ff2(x)
-        return x
+    def forward(self, x, valid):
+        mask = valid.unsqueeze(-1)
+        x = (x + 0.5 * self.ff1(x)).masked_fill(~mask, 0)
+        attn_out, _ = self.self_attn(
+            x, x, x, key_padding_mask=~valid, need_weights=False
+        )
+        x = self.ln1(x + attn_out).masked_fill(~mask, 0)
+        x_conv = masked_conv(
+            self.conv, self.ln2(x).transpose(1, 2), valid
+        ).transpose(1, 2)
+        x = (x + x_conv).masked_fill(~mask, 0)
+        return (x + 0.5 * self.ff2(x)).masked_fill(~mask, 0)
 
 class BIOPhonemeTagger(nn.Module):
-    def __init__(self, config, label_list):
+    def __init__(self, config, label_list, whisper_state=None):
         super().__init__()
-        encoder_type = config["model"]["encoder_type"].lower()
-        model_name = config["model"]["whisper_model"] if encoder_type == "whisper" else config["model"]["wavlm_model"]
+        self.config = config
+        self.encoder_type = config["model"].get("encoder_type", "whisper").lower()
+        model_name = config["model"].get("whisper_model", "openai/whisper-base")
 
-        self.encoder_type = encoder_type
-        self.freeze_encoder = config["model"].get("freeze_encoder", False)
-        self.enable_bilstm = config["model"].get("enable_bilstm", True)
+        if self.encoder_type == "whisper":
+            if whisper_state is not None:
+                encoder_config = whisper_config_from_state(whisper_state)
+                self.feature_extractor = WhisperFeatureExtractor(feature_size=encoder_config.num_mel_bins)
+                self.encoder = WhisperEncoder(encoder_config)
+            else:
+                encoder_dir = os.path.join(os.getcwd(), "encoder")
+                if not os.path.exists(encoder_dir) or not os.listdir(encoder_dir):
+                    print(f"Downloading Whisper ({model_name})...")
+                    os.makedirs(encoder_dir, exist_ok=True)
+                    ext = WhisperFeatureExtractor.from_pretrained(model_name)
+                    mod = WhisperModel.from_pretrained(model_name)
+                    ext.save_pretrained(encoder_dir)
+                    mod.save_pretrained(encoder_dir)
+                    del mod
 
-        self.enable_dilated_conv = config["model"].get("enable_dilated_conv", True)
-        self.dilated_conv_depth = config["model"].get("dilated_conv_depth", 2)
-        self.dilated_conv_kernel = config["model"].get("dilated_conv_kernel", 3)
+                self.feature_extractor = WhisperFeatureExtractor.from_pretrained(encoder_dir)
+                self.encoder = WhisperModel.from_pretrained(encoder_dir).encoder
 
-        if encoder_type == "whisper":
-            self.feature_extractor = WhisperFeatureExtractor.from_pretrained(model_name)
-            self.encoder = WhisperModel.from_pretrained(model_name).encoder
             hidden_size = self.encoder.config.d_model
-        elif encoder_type == "wavlm":
-            from transformers import WavLMConfig
-            self.feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained(model_name)
-            # bug fix
-            wavlm_config = WavLMConfig.from_pretrained(model_name)
-            wavlm_config.apply_spec_augment = False
-            wavlm_config.mask_time_prob = 0.0
-            wavlm_config.mask_time_length = 0
-            self.encoder = WavLMModel.from_pretrained(model_name, config=wavlm_config)
-            hidden_size = self.encoder.config.hidden_size
-        elif encoder_type in ("none", "null"):
+            self.layer_weights = nn.Parameter(torch.zeros(len(self.encoder.layers) + 1))
+        else:
             self.encoder = None
             self.feature_extractor = None
             self.mel_extractor = torchaudio.transforms.MelSpectrogram(
-                sample_rate=config["data"]["sample_rate"],
-                n_fft=400,
+                sample_rate=config["data"]["sample_rate"], n_fft=400,
                 hop_length=int(config["data"].get("frame_duration", 0.02) * config["data"]["sample_rate"]),
                 n_mels=config["data"].get("n_mels", 80)
             )
             hidden_size = self.mel_extractor.n_mels
 
-        else:
-            raise ValueError("Unsupported encoder type. Use 'whisper', 'wavlm', or 'none'.")
-
         self.lang_emb_dim = config["model"].get("lang_emb_dim", 64)
         self.lang_emb = nn.Embedding(config["model"]["num_languages"], self.lang_emb_dim)
         self.lang_proj = nn.Linear(hidden_size + self.lang_emb_dim, hidden_size)
 
-        if self.freeze_encoder:
-            for param in self.encoder.parameters():
-                param.requires_grad = False
+        # i'm disabling whisper finetuning since it's no good </3
+        if self.encoder is not None:
+            self.encoder.requires_grad_(False)
+            self.encoder.eval()
 
-        if self.enable_bilstm:
-            self.bilstm = nn.LSTM(
-                input_size=hidden_size,
-                hidden_size=hidden_size // 2,
-                num_layers=config["model"].get("bilstm_num_layer", 1),
-                batch_first=True,
-                bidirectional=True
-            )
-        else:
-            self.bilstm = None
-
+        self.spec_aug = SpecAugment()
+        
         self.conformer_layers = nn.ModuleList([
             ConformerBlock(
                 dim=hidden_size,
@@ -123,79 +246,103 @@ class BIOPhonemeTagger(nn.Module):
             for _ in range(config["model"].get("num_conformer_layers", 2))
         ])
 
-        if self.enable_dilated_conv:
+        if config["model"].get("enable_dilated_conv", True):
             convs = []
-            for i in range(self.dilated_conv_depth):
+            depth = config["model"].get("dilated_conv_depth", 2)
+            k_size = config["model"].get("dilated_conv_kernel", 3)
+            for i in range(depth):
                 dilation = 2 ** i
-                padding = dilation * (self.dilated_conv_kernel - 1) // 2
-                convs.append(nn.Conv1d(hidden_size, hidden_size, kernel_size=self.dilated_conv_kernel, dilation=dilation, padding=padding))
-                convs.append(nn.ReLU())
+                padding = dilation * (k_size - 1) // 2
+                convs.append(nn.Conv1d(hidden_size, hidden_size, kernel_size=k_size, dilation=dilation, padding=padding))
+                convs.append(nn.GELU())
             self.dilated_conv_stack = nn.Sequential(*convs)
+        else:
+            self.dilated_conv_stack = nn.Identity()
 
         self.classifier = nn.Linear(hidden_size, len(label_list))
-
         self.boundary_offset_head = nn.Sequential(
             nn.Conv1d(hidden_size, hidden_size, kernel_size=3, padding=1),
             nn.GELU(),
-            nn.Conv1d(hidden_size, 2, kernel_size=1),  # [B, 2, T]
-            nn.Sigmoid()  # clamp to [0,1]
+            nn.Conv1d(hidden_size, 2, kernel_size=1),
+            nn.Sigmoid()
         )
 
         self.label_list = label_list
         self.label2id = {label: i for i, label in enumerate(label_list)}
         self.id2label = {i: label for label, i in self.label2id.items()}
 
-    def forward(self, input_values, lang_id=None, max_label_len=None):
-        if self.encoder_type in ("none", "null"):
-            hidden_states = self.mel_extractor(input_values).transpose(1, 2).to(input_values.device)
-
-        elif self.encoder_type == "whisper":
-            features = self.feature_extractor(input_values.cpu().numpy(), sampling_rate=16000, return_tensors="pt")
+    def train(self, mode=True): # dropout prevention
+        super().train(mode)
+        if self.encoder is not None:
+            self.encoder.eval()
+        return self
+        
+    def forward(self, input_values, lang_id=None, max_label_len=None, lengths=None):
+        if self.encoder_type == "whisper":
+            features = self.feature_extractor(
+                input_values.cpu().numpy(), sampling_rate=16000,
+                return_tensors="pt",
+            )
             input_features = features["input_features"].to(input_values.device)
-            encoder_outputs = self.encoder(input_features)
-            hidden_states = encoder_outputs.last_hidden_state
-
-        elif self.encoder_type == "wavlm":
-            features = self.feature_extractor(input_values.cpu().numpy(), sampling_rate=16000, return_tensors="pt")
-            input_features = features["input_values"].to(input_values.device)
-            hidden_states = self.encoder(input_features).last_hidden_state
-
+            with torch.no_grad():
+                encoder_out = self.encoder(
+                    input_features,
+                    output_hidden_states=True,
+                    return_dict=True
+                )
+            weights = self.layer_weights.softmax(dim=0)
+            hidden_states = sum(
+                weight.to(state.dtype) * F.layer_norm(state, (state.size(-1),))
+                for weight, state in zip(weights, encoder_out.hidden_states)
+            )
         else:
-            raise ValueError("Unsupported encoder_type")
+            hidden_states = self.mel_extractor(input_values).transpose(1, 2)
 
-        if max_label_len is not None:
-            current_len = hidden_states.size(1)
-            if current_len > max_label_len:
-                hidden_states = hidden_states[:, :max_label_len, :]
-            elif current_len < max_label_len:
-                pad_len = max_label_len - current_len
-                padding = torch.zeros(hidden_states.size(0), pad_len, hidden_states.size(2),
-                                      device=hidden_states.device)
-                hidden_states = torch.cat([hidden_states, padding], dim=1)
+        if lengths is None:
+            frame_samples = (
+                self.config["data"]["sample_rate"]
+                * self.config["data"].get("frame_duration", 0.02)
+            )
+            count = (
+                int(max_label_len) if max_label_len is not None
+                else math.ceil(input_values.size(-1) / frame_samples)
+            )
+            lengths = [count] * input_values.size(0)
+
+        lengths = torch.as_tensor(
+            lengths, dtype=torch.long, device=input_values.device
+        )
+        if lengths.shape != (input_values.size(0),) or (lengths < 1).any():
+            raise ValueError("Expected one positive frame length per sample.")
+
+        max_len = int(lengths.max().item())
+        if max_len > hidden_states.size(1):
+            raise ValueError("Labels exceed encoder output. Split long audio first.")
+
+        hidden_states = hidden_states[:, :max_len]
+        if self.training:
+            hidden_states = self.spec_aug(hidden_states, lengths)
+            
+        valid = torch.arange(max_len, device=input_values.device)[None, :] < lengths[:, None]
+        mask = valid.unsqueeze(-1)
 
         if lang_id is not None:
-            lang_embed = self.lang_emb(lang_id)
-            lang_embed = lang_embed.unsqueeze(1).expand(-1, hidden_states.size(1), -1)
-            hidden_states = torch.cat([hidden_states, lang_embed], dim=-1)
-            hidden_states = self.lang_proj(hidden_states)
+            lang_embed = self.lang_emb(lang_id).unsqueeze(1).expand(-1, max_len, -1)
+            hidden_states = self.lang_proj(
+                torch.cat([hidden_states, lang_embed], dim=-1)
+            )
 
-        if self.enable_bilstm and self.bilstm is not None:
-            hidden_states, _ = self.bilstm(hidden_states)
-        out = hidden_states
-
+        out = hidden_states.masked_fill(~mask, 0)
         for layer in self.conformer_layers:
-            out = layer(out)
+            out = layer(out, valid)
 
-        if self.enable_dilated_conv:
-            out = self.dilated_conv_stack(out.transpose(1, 2)).transpose(1, 2)
+        out = masked_conv(
+            self.dilated_conv_stack, out.transpose(1, 2), valid
+        ).transpose(1, 2)
 
-        logits = self.classifier(out)
-        offsets = self.boundary_offset_head(out.transpose(1, 2)).transpose(1, 2)  # [B, T, 2]
+        logits = self.classifier(out).masked_fill(~mask, 0)
+        offsets = masked_conv(
+            self.boundary_offset_head, out.transpose(1, 2), valid
+        ).transpose(1, 2)
+        
         return logits, offsets
-
-    def decode_predictions(self, logits):
-        pred_ids = torch.argmax(logits, dim=-1)
-        return pred_ids
-
-    def id_to_label(self, ids):
-        return [[self.id2label[i.item()] for i in seq] for seq in ids]

@@ -1,6 +1,6 @@
 # WFL-ASR: Whisper for Phoneme Labeling
 
-**WFL-ASR** is a deep learning model designed for automatic phoneme segmentation using frame-level BIO tagging. It uses Whisper as audio encoders, and is structured for flexible and efficient training on phoneme-aligned (HTK) datasets.
+**WFL-ASR** is a configurable deep learning model designed for automatic phoneme segmentation using frame-level BIO tagging. It uses Whisper as an audio encoder and is structured for flexible and efficient training on phoneme-aligned (HTK) datasets.
 
 ---
 
@@ -14,7 +14,7 @@ This model performs **frame-level phoneme labeling** using the BIO tag format (`
 - Tags are stored along with the audio path in a training JSON.
 
 ### 2. Feature Extraction
-- **Whisper** encoders process the audio waveform into frame-wise feature vectors.
+- **Whisper** encoder processes the audio waveform into frame-wise feature vectors.
   - Whisper uses fixed 20ms frame stride.
 
 ### 3. Classification
@@ -22,7 +22,6 @@ This model performs **frame-level phoneme labeling** using the BIO tag format (`
 
 ### 4. Inference and Postprocessing
 - Predict BIO tags from audio.
-- Optional smoothing (median filtering) and merging for better boundary clarity.
 - Convert tags back to `.lab` segments.
 
 ---
@@ -31,24 +30,9 @@ This model performs **frame-level phoneme labeling** using the BIO tag format (`
 
 - Whisper encoder support
 - Frame-level BIO tag training
+- Configurable architecture (please tune the configs, the current values are all experimental)
 - HTK-compatible `.lab` output format
-- Optional waveform augmentation via the `augmentation` config section
-
----
-
-## Augmentation Options
-
-The `config.yaml` file now includes an optional `augmentation` section used during training. When enabled it randomly applies volume scaling and Gaussian noise:
-
-```yaml
-augmentation:
-  enable: true
-  noise_std: 0.005      # standard deviation of Gaussian noise
-  prob: 0.5             # probability to augment a sample
-  volume_range: [0.9, 1.1]  # random scaling of audio volume
-```
-
-Disable augmentation by setting `enable: false`.
+- Forced-Alignment ability when `.txt` transcription is available
 
 ---
 
