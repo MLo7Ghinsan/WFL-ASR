@@ -125,6 +125,17 @@ def _log_softmax(x):
     return x - lse
 
 
+def ctc_greedy_decode(ctc_logits, vocab, blank=0):
+    # argmax per frame, merge repeats, drop blanks
+    ids = ctc_logits.argmax(dim=-1).tolist()
+    phones, prev = [], blank
+    for i in ids:
+        if i != blank and i != prev:
+            phones.append(vocab[i])
+        prev = i
+    return phones
+
+
 def forced_predict_slot(phones, forced_phones, label2id):
     forced = []
     for p in forced_phones or []:
@@ -200,24 +211,24 @@ def forced_align_bio(
         emit[:, idx_OB(j)] = logp[:, label2id[f"B-{p}"]] + forced_pred_penalty
         emit[:, idx_OI(j)] = logp[:, label2id[f"I-{p}"]]
 
-    trans_from = [[] for _ in range(S)]
+    trans_form = [[] for _ in range(S)]
 
     # O_k -> O_k, O_k -> B_k
     for k in range(N + 1):
-        trans_from[idx_O(k)].append(idx_O(k))
+        trans_form[idx_O(k)].append(idx_O(k))
         if k < N:
-            trans_from[idx_O(k)].append(idx_B(k))
+            trans_form[idx_O(k)].append(idx_B(k))
 
     # B_k -> I_k
     for k in range(N):
-        trans_from[idx_B(k)].append(idx_I(k))
+        trans_form[idx_B(k)].append(idx_I(k))
 
     # I_k -> I_k, I_k -> O_{k+1}, I_k -> B_{k+1}
     for k in range(N):
-        trans_from[idx_I(k)].append(idx_I(k))
-        trans_from[idx_I(k)].append(idx_O(k + 1))
+        trans_form[idx_I(k)].append(idx_I(k))
+        trans_form[idx_I(k)].append(idx_O(k + 1))
         if k + 1 < N:
-            trans_from[idx_I(k)].append(idx_B(k + 1))
+            trans_form[idx_I(k)].append(idx_B(k + 1))
 
     # forced o in gap k
     for j, (k, _) in enumerate(opt):
@@ -244,7 +255,7 @@ def forced_align_bio(
             ps = prev[s_prev]
             if ps == -np.inf:
                 continue
-            for s_next in trans_from[s_prev]:
+            for s_next in trans_form[s_prev]:
                 sc = ps + emit[t, s_next]
                 if sc > cur[s_next]:
                     cur[s_next] = sc

@@ -18,6 +18,7 @@ finetune:
     layer_mixing: 0.00001
     acoustic_stack: 0.00002
     boundary_head: 0.00002
+    ctc_head: 0.0005 # starts from random init if the source checkpoint has no CTC head
 
 data:
   data_dir: "training_dataset_"

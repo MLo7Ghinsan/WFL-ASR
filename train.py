@@ -12,6 +12,7 @@ import matplotlib
 import numpy as np
 import soundfile as sf
 import torch
+import torch.nn.functional as F
 import torchaudio
 import yaml
 
@@ -22,9 +23,15 @@ import pytorch_optimizer as optim
 from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
 from torch.utils.data import DataLoader, Dataset, Subset, random_split
 
-from infer import continuous_segments, viterbi_decode
+from infer import continuous_segments, forced_align_viterbi, viterbi_decode
 from model import BIOPhonemeTagger, FocalLoss
-from utils import decode_bio_tags, load_phoneme_list, visualize_prediction, load_langs
+from utils import (
+    ctc_greedy_decode,
+    decode_bio_tags,
+    load_langs,
+    load_phoneme_list,
+    visualize_prediction,
+)
 from finetune_utils import load_wfl_config, read_checkpoint, transfer_wfl_weights
 
 
@@ -227,6 +234,7 @@ class WFLModel(pl.LightningModule):
 
         self.criterion = FocalLoss(alpha=0.5, gamma=2.0, ignore_index=-100)
         self.offset_weight = config["model"].get("subframe_loss_weight", 5.0)
+        self.ctc_weight = config["model"].get("ctc_loss_weight", 0.5)
         self.frame_duration = config["data"].get("frame_duration", 0.02)
 
         total_val = config["data"]["num_val_files"]
@@ -265,12 +273,84 @@ class WFLModel(pl.LightningModule):
         total_loss = cls_loss + total_offset_loss
         return total_loss, cls_loss, total_offset_loss
 
+    def calculate_ctc_loss(self, ctc_logits, segs_gt, lengths):
+        # target = gt phoneme sequence
+        phone2id = self.model.ctc_phone2id
+        targets = [[phone2id[ph] for _, _, ph in segs] for segs in segs_gt]
+        target_lengths = torch.tensor(
+            [len(t) for t in targets], dtype=torch.long, device=self.device
+        )
+        flat_targets = torch.tensor(
+            [i for t in targets for i in t], dtype=torch.long, device=self.device
+        )
+        log_probs = F.log_softmax(ctc_logits.float(), dim=-1).transpose(0, 1)
+        loss = F.ctc_loss(
+            log_probs,
+            flat_targets,
+            lengths,
+            target_lengths,
+            blank=0,
+            reduction="sum",
+            zero_infinity=True,
+        )
+        return loss / lengths.sum().clamp_min(1)
+
+    def _forced_align_tags(self, logits, phones, insert_forced=True):
+        post = self.config.get("postprocess", {})
+        fa_args = post.get("forced_alignment_args", {})
+        forced = []
+        if insert_forced:
+            label2id = self.model.label2id
+            forced = [
+                p for p in (post.get("forced_predict_fa") or [])
+                if f"B-{p}" in label2id and f"I-{p}" in label2id
+            ]
+        return forced_align_viterbi(
+            logits,
+            self.id2label,
+            phones,
+            self_loop_penalty=fa_args.get("self_loop_penalty", -4.6),
+            forward_penalty=fa_args.get("forward_penalty", -0.6),
+            skip_penalty=fa_args.get("skip_penalty", -2.3),
+            forced_pred_phones=forced,
+            forced_pred_penalty=fa_args.get("forced_predict_penalty", 0.0),
+        )
+
+    def _ctc_align(self, logits, offsets, phones, duration):
+        tags = self._forced_align_tags(logits, phones)
+        return continuous_segments(
+            decode_bio_tags(tags, self.frame_duration, offsets.detach().cpu()),
+            duration,
+        )
+
+    def _boundary_errors(self, logits, offsets, gt_segments):
+        phones = [ph for _, _, ph in gt_segments]
+        if len(phones) < 2 or len(phones) > logits.size(0):
+            return None
+        tags = self._forced_align_tags(logits, phones, insert_forced=False)
+        pred = decode_bio_tags(tags, self.frame_duration, offsets.detach().cpu())
+        if [ph for _, _, ph in pred] != phones:
+            return None
+        return [abs(p[0] - g[0]) for p, g in zip(pred[1:], gt_segments[1:])]
+
     def training_step(self, batch, batch_idx):
         inputs, labels, wavs, segs_gt, _, langs, lengths = batch
-        logits, offsets = self(inputs, langs, lengths)
+        logits, offsets, ctc_logits = self(inputs, langs, lengths)
         loss, cls_loss, off_loss = self.calculate_loss(
             logits, offsets, labels, segs_gt, lengths
         )
+
+        total_loss = loss
+        if ctc_logits is not None:
+            ctc_loss = self.calculate_ctc_loss(ctc_logits, segs_gt, lengths)
+            total_loss = loss + self.ctc_weight * ctc_loss
+            self.log(
+                "train/ctc_loss",
+                ctc_loss,
+                on_step=False,
+                on_epoch=True,
+                batch_size=inputs.size(0),
+            )
 
         self.log(
             "train/loss",
@@ -294,7 +374,7 @@ class WFLModel(pl.LightningModule):
             on_epoch=True,
             batch_size=inputs.size(0),
         )
-        return loss
+        return total_loss
 
     def on_validation_epoch_start(self):
         self.val_vis_count = 0
@@ -325,10 +405,19 @@ class WFLModel(pl.LightningModule):
 
     def validation_step(self, batch, batch_idx):
         inputs, labels, wavs, segs_gt, _, langs, lengths = batch
-        logits, offsets = self(inputs, langs, lengths)
+        logits, offsets, ctc_logits = self(inputs, langs, lengths)
         loss, cls_loss, off_loss = self.calculate_loss(
             logits, offsets, labels, segs_gt, lengths
         )
+
+        if ctc_logits is not None:
+            self.log(
+                "val/ctc_loss",
+                self.calculate_ctc_loss(ctc_logits, segs_gt, lengths),
+                on_step=False,
+                on_epoch=True,
+                batch_size=inputs.size(0),
+            )
 
         valid = labels != -100
         frame_count = int(valid.sum().item())
@@ -356,7 +445,8 @@ class WFLModel(pl.LightningModule):
                 batch_size=inputs.size(0),
             )
 
-        errors, phone_count = 0, 0
+        errors, ctc_errors, phone_count = 0, 0, 0
+        boundary_errors = []
         for i, wav in enumerate(wavs):
             length = int(lengths[i].item())
             tags = viterbi_decode(
@@ -375,10 +465,38 @@ class WFLModel(pl.LightningModule):
             errors += self._edit_distance(reference, prediction)
             phone_count += len(reference)
 
+            boundary_errors.extend(
+                self._boundary_errors(
+                    logits[i, :length], offsets[i, :length], segs_gt[i]
+                ) or []
+            )
+
+            ctc_phones = None
+            if ctc_logits is not None:
+                ctc_phones = ctc_greedy_decode(
+                    ctc_logits[i, :length], self.model.ctc_vocab
+                )
+                ctc_errors += self._edit_distance(
+                    reference, self._collapse_phones(ctc_phones)
+                )
+
             if self.val_vis_count < self.num_vis_samples:
                 self._log_visualization(
                     wav, pred_segments, segs_gt[i], self.val_vis_count
                 )
+                if ctc_phones:
+                    self._log_visualization(
+                        wav,
+                        self._ctc_align(
+                            logits[i, :length],
+                            offsets[i, :length],
+                            ctc_phones,
+                            len(wav) / 16000,
+                        ),
+                        segs_gt[i],
+                        self.val_vis_count,
+                        tag="ctc_align",
+                    )
                 self.val_vis_count += 1
 
         if phone_count:
@@ -390,23 +508,65 @@ class WFLModel(pl.LightningModule):
                 prog_bar=True,
                 batch_size=phone_count,
             )
+            if ctc_logits is not None:
+                self.log(
+                    "val/ctc_per",
+                    logits.new_tensor(100.0 * ctc_errors / phone_count),
+                    on_step=False,
+                    on_epoch=True,
+                    prog_bar=True,
+                    batch_size=phone_count,
+                )
+
+        if boundary_errors:
+            errors_ms = 1000.0 * torch.tensor(
+                boundary_errors, dtype=torch.float32, device=self.device
+            )
+            self.log(
+                "val/boundary_mae_ms",
+                errors_ms.mean(),
+                on_step=False,
+                on_epoch=True,
+                batch_size=len(boundary_errors),
+            )
+            self.log(
+                "val/boundary_acc_20ms",
+                (errors_ms <= 20.0).float().mean() * 100,
+                on_step=False,
+                on_epoch=True,
+                batch_size=len(boundary_errors),
+            )
         return loss
 
     def on_validation_epoch_end(self):
         metrics = self.trainer.callback_metrics
+        ctc_part = (
+            f" | CTC PER: {metrics['val/ctc_per']:.2f}%"
+            if "val/ctc_per" in metrics
+            else ""
+        )
+        boundary_part = (
+            f" | Boundary error: {metrics['val/boundary_mae_ms']:.1f} ms "
+            f"({metrics['val/boundary_acc_20ms']:.1f}% within 20 ms)"
+            if "val/boundary_mae_ms" in metrics
+            else ""
+        )
         print(
             f"\n[Epoch {self.current_epoch}] "
             f"Loss: {metrics.get('val/loss', 0.0):.4f} | "
             f"Frame accuracy: {metrics.get('val/acc', 0.0):.2f}% | "
             f"PER: {metrics.get('val/per', float('nan')):.2f}%"
+            f"{ctc_part}{boundary_part}"
         )
 
-    def _log_visualization(self, wav, pred_segments, gt_segments, sample_idx=0):
+    def _log_visualization(
+        self, wav, pred_segments, gt_segments, sample_idx=0, tag="prediction"
+    ):
         fig = visualize_prediction(wav, 16000, pred_segments, gt_segments)
         try:
             if self.logger:
                 self.logger.experiment.add_figure(
-                    f"val/prediction_{sample_idx}",
+                    f"val/{tag}_{sample_idx}",
                     fig,
                     global_step=self.global_step,
                 )
@@ -459,6 +619,9 @@ class WFLModel(pl.LightningModule):
             add_group(self.model.conformer_layers, "acoustic_stack")
             add_group(self.model.dilated_conv_stack, "acoustic_stack")
             add_group(self.model.boundary_offset_head, "boundary_head")
+            if self.model.ctc_proj is not None:
+                add_group(self.model.ctc_layers, "ctc_head")
+                add_group(self.model.ctc_proj, "ctc_head")
 
             if hasattr(self.model, "layer_weights"):
                 groups.append({
@@ -577,7 +740,9 @@ def main():
         logger=pl.loggers.TensorBoardLogger(
             save_dir=config["training"]["log_dir"], name="lightning_logs"
         ),
-        accelerator="auto",
+        accelerator={"auto": "auto", "cpu": "cpu", "gpu": "gpu", "cuda": "gpu"}[
+            str(config["model"].get("device", "auto")).lower()
+        ],
         devices=1,
         precision=config["training"].get("precision", "32"),
         accumulate_grad_batches=config["training"].get("accumulate_grad_batches", 1),

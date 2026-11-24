@@ -10,9 +10,10 @@ import yaml
 from librosa.sequence import _viterbi
 from numba import bool, float64, njit, uint16, int32
 
-from model import BIOPhonemeTagger
+from model import BIOPhonemeTagger, ctc_config_from_state
 from utils import (
     canonical_to_lang,
+    ctc_greedy_decode,
     decode_bio_tags,
     forced_align_bio,
     load_langs,
@@ -385,12 +386,13 @@ def process_audio(
     viterbi_bias=5,
     visualize_probabilities=False,
     visualize_labels=False,
+    label_mode="frame",
 ):
     if visualize_probabilities:
         import matplotlib.pyplot as plt
 
     if len(audio) == 0:
-        return []
+        return [], phones
     original_duration = len(audio) / sr
 
     audio = audio / (np.max(np.abs(audio)) + 1e-8)
@@ -406,6 +408,7 @@ def process_audio(
 
     accumulated_logits = []
     accumulated_offsets = []
+    accumulated_ctc = []
 
     for start in range(0, total_len, CHUNK_SIZE):
         end = min(start + CHUNK_SIZE, total_len)
@@ -424,17 +427,32 @@ def process_audio(
         lengths = torch.tensor([expected_frames], device=device)
 
         with torch.no_grad():
-            logits, offsets = model(input_values, lang_tensor, lengths=lengths)
+            logits, offsets, ctc_logits = model(
+                input_values, lang_tensor, lengths=lengths
+            )
 
         accumulated_logits.append(logits.squeeze(0).cpu())
         if offsets is not None:
             accumulated_offsets.append(offsets.squeeze(0).cpu())
+        if ctc_logits is not None:
+            accumulated_ctc.append(ctc_logits.squeeze(0).cpu())
 
     full_logits = torch.cat(accumulated_logits, dim=0)
 
     full_offsets = None
     if accumulated_offsets and not no_use_offset:
         full_offsets = torch.cat(accumulated_offsets, dim=0)
+
+    # transcribe then align
+    if not phones and label_mode == "transcribe":
+        if not accumulated_ctc:
+            raise ValueError("label_mode 'transcribe' needs a checkpoint with a CTC head.")
+        phones = ctc_greedy_decode(torch.cat(accumulated_ctc, dim=0), model.ctc_vocab)
+        if phones:
+            print(f"Transcribed {len(phones)} phonemes: {' '.join(phones)}")
+        else:
+            print("CTC head predicted no phonemes; falling back to frame decoding.")
+            phones = None
 
     if phones:
         postprocess = config.get("postprocess", {})
@@ -509,7 +527,7 @@ def process_audio(
         plt.tight_layout()
         plt.show()
 
-    return continuous_seg
+    return continuous_seg, phones
 
 
 @click.command()
@@ -587,6 +605,15 @@ def process_audio(
     is_flag=True,
     help="Visualize the predicted labels when visualizing probabilities",
 )
+@click.option(
+    "--label-mode",
+    "-mode",
+    type=click.Choice(["frame", "transcribe"]),
+    default=None,
+    help=(
+        "frame: predicting phoneme frames by rames | transcribe: predicting phoneme sequence then align"
+    ),
+)
 def main(
     input_path,
     checkpoint,
@@ -600,6 +627,7 @@ def main(
     viterbi_bias,
     visualize_probabilities,
     visualize_labels,
+    label_mode,
 ):
     checkpoint_dir = os.path.dirname(os.path.abspath(checkpoint))
 
@@ -623,13 +651,27 @@ def main(
         config = os.path.join(checkpoint_dir, yaml_files[0])
 
     cfg = load_config(config)
-    device = (
-        "cuda"
-        if torch.cuda.is_available()
-        else "mps"
-        if torch.mps.is_available()
-        else "cpu"
-    )
+    requested = str(cfg.get("model", {}).get("device", "auto")).lower()
+    if requested == "auto":
+        device = (
+            "cuda"
+            if torch.cuda.is_available()
+            else "mps"
+            if torch.backends.mps.is_available()
+            else "cpu"
+        )
+    elif requested in ("gpu", "cuda"):
+        if torch.cuda.is_available():
+            device = "cuda"
+        elif torch.backends.mps.is_available():
+            device = "mps"
+        else:
+            print("Warning: model.device requests GPU but none found; using CPU.")
+            device = "cpu"
+    elif requested == "cpu":
+        device = "cpu"
+    else:
+        raise ValueError(f"model.device must be auto, cpu or gpu (got {requested!r})")
     print(f"Running on: {device}")
 
     save_dir = checkpoint_dir
@@ -675,11 +717,30 @@ def main(
             "No WFL model weights found in checkpoint"
         )
 
+    # safeguard so older checkpoints dont break when they dont have CTC
+    has_ctc, ctc_layers = ctc_config_from_state(new_state_dict)
+    cfg["model"]["ctc_conformer_layers"] = ctc_layers
+
+    if label_mode is None:
+        label_mode = cfg.get("postprocess", {}).get("label_mode", "frame")
+    if label_mode not in ("frame", "transcribe"):
+        raise click.BadParameter(
+            f"must be frame or transcribe (got {label_mode!r})",
+            param_hint="postprocess.label_mode",
+        )
+    if label_mode == "transcribe" and not has_ctc:
+        raise click.ClickException(
+            "label mode 'transcribe' needs a CTC head, and this checkpoint was "
+            "trained before it existed. Retrain or fine-tune it to add one."
+        )
+    print(f"Label mode: {label_mode}")
+
     # No more whisper download lmao
     model = BIOPhonemeTagger(
         cfg,
         labels,
         whisper_state=new_state_dict,
+        with_ctc=has_ctc,
     ).to(device)
 
     try:
@@ -728,7 +789,7 @@ def main(
             ).numpy()
             sr = cfg["data"]["sample_rate"]
 
-        segments = process_audio(
+        segments, phones = process_audio(
             model,
             audio,
             sr,
@@ -743,6 +804,7 @@ def main(
             viterbi_bias=viterbi_bias,
             visualize_probabilities=visualize_probabilities,
             visualize_labels=visualize_labels,
+            label_mode=label_mode,
         )
 
         if (

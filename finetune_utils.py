@@ -63,6 +63,8 @@ def _langs_from_file(path):
     return result
 
 def transfer_wfl_weights(model, source_ckpt, source_path, target_dir, target_labels):
+    from model import ctc_vocab_from_labels
+
     source_path = Path(source_path)
     source = source_ckpt["state_dict"]
     target = model.state_dict()
@@ -74,7 +76,7 @@ def transfer_wfl_weights(model, source_ckpt, source_path, target_dir, target_lab
     # this transfer expects the WFL architecture to come from the source checkpoint
     # only language count and vocabulary dimensions can change
     for key, tensor in target.items():
-        if key in special:
+        if key in special or key.startswith("model.ctc_"):
             continue
         if key not in source:
             raise ValueError(f"missing checkpoint parameter: {key}")
@@ -105,6 +107,36 @@ def transfer_wfl_weights(model, source_ckpt, source_path, target_dir, target_lab
             target["model.classifier.bias"][new_idx] = source["model.classifier.bias"][old_idx]
             matched += 1
 
+    ctc_note = None
+    ctc_keys = [k for k in target if k.startswith("model.ctc_")]
+    if ctc_keys:
+        if "model.ctc_proj.weight" not in source:
+            ctc_note = "source has no CTC head; it starts from random init"
+        else:
+            for key in ctc_keys:
+                if key.startswith("model.ctc_proj."):
+                    continue
+                if key not in source or source[key].shape != target[key].shape:
+                    raise ValueError(
+                        f"incompatible CTC layer {key}: set model.ctc_conformer_layers "
+                        "to match the source checkpoint"
+                    )
+                target[key] = source[key]
+            # remap the output rows by phoneme name like the classifier
+            old_vocab = ctc_vocab_from_labels(old_labels)
+            if len(old_vocab) != source["model.ctc_proj.weight"].shape[0]:
+                raise ValueError("Source label list does not match CTC head rows.")
+            old_row = {p: i for i, p in enumerate(old_vocab)}
+            new_vocab = ctc_vocab_from_labels(target_labels)
+            ctc_matched = 0
+            for new_idx, phone in enumerate(new_vocab):
+                old_idx = old_row.get(phone)
+                if old_idx is not None:
+                    for part in ("weight", "bias"):
+                        target[f"model.ctc_proj.{part}"][new_idx] = source[f"model.ctc_proj.{part}"][old_idx]
+                    ctc_matched += 1
+            ctc_note = f"transferred {ctc_matched - 1}/{len(new_vocab) - 1} CTC phonemes by name"
+
     old_langs = source_ckpt.get("wfl_lang2id")
     if old_langs is None:
         langs_file = source_path.parent / "langs.txt"
@@ -123,6 +155,8 @@ def transfer_wfl_weights(model, source_ckpt, source_path, target_dir, target_lab
 
     model.load_state_dict(target, strict=True)
     print(f"transferred {matched}/{len(target_labels)} classifier labels by name.")
+    if ctc_note:
+        print(ctc_note)
     print(f"reused language embeddings: {reused_langs}")
     print(f"new or unmapped languages: {sorted(set(new_langs) - set(reused_langs))}")
     print("all shared acoustic layers transferred")

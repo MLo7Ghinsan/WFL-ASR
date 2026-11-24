@@ -4,8 +4,20 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchaudio
-from transformers import WhisperFeatureExtractor, WhisperModel
+from transformers import WhisperConfig, WhisperFeatureExtractor, WhisperModel
 from transformers.models.whisper.modeling_whisper import WhisperEncoder
+
+CTC_BLANK = "<blank>"
+
+def ctc_vocab_from_labels(label_list):
+    return [CTC_BLANK] + [tag[2:] for tag in label_list if tag.startswith("B-")]
+
+
+def ctc_config_from_state(state):
+    layer_ids = {
+        k.split(".")[1] for k in state if k.startswith("ctc_layers.")
+    }
+    return "ctc_proj.weight" in state, len(layer_ids)
 
 def whisper_config_from_state(state):
     if "model.encoder.conv1.weight" in state:
@@ -213,6 +225,21 @@ class BIOPhonemeTagger(nn.Module):
                 self.encoder = WhisperModel.from_pretrained(encoder_dir).encoder
 
             hidden_size = self.encoder.config.d_model
+
+            fe = self.feature_extractor
+            self.mel_n_fft = fe.n_fft
+            self.mel_hop = fe.hop_length
+            self.mel_n_samples = fe.n_samples
+            self.register_buffer(
+                "whisper_mel_filters",
+                torch.as_tensor(fe.mel_filters, dtype=torch.float32),
+                persistent=False,
+            )
+            self.register_buffer(
+                "whisper_stft_window",
+                torch.hann_window(fe.n_fft),
+                persistent=False,
+            )
             self.layer_weights = nn.Parameter(torch.zeros(len(self.encoder.layers) + 1))
         else:
             self.encoder = None
@@ -271,19 +298,50 @@ class BIOPhonemeTagger(nn.Module):
         self.label2id = {label: i for i, label in enumerate(label_list)}
         self.id2label = {i: label for label, i in self.label2id.items()}
 
+        # CTC
+        self.ctc_layers = None
+        self.ctc_proj = None
+        self.ctc_vocab = ctc_vocab_from_labels(label_list)
+        self.ctc_phone2id = {p: i for i, p in enumerate(self.ctc_vocab)}
+        self.ctc_layers = nn.ModuleList([
+            ConformerBlock(
+                dim=hidden_size,
+                heads=config["model"].get("conformer_heads", 4),
+                ff_expansion=config["model"].get("conformer_ff_expansion", 4),
+                conv_kernel=config["model"].get("conformer_kernel_size", 31),
+                dropout=config["model"].get("conformer_dropout", 0.1)
+            )
+            for _ in range(config["model"].get("ctc_conformer_layers", 2))
+        ])
+        self.ctc_proj = nn.Linear(hidden_size, len(self.ctc_vocab))
+
     def train(self, mode=True): # dropout prevention
         super().train(mode)
         if self.encoder is not None:
             self.encoder.eval()
         return self
         
+    @torch.no_grad()
+    def whisper_log_mel(self, audio): # thanks claude, i couldnt figure it out lmao
+        with torch.autocast(device_type=audio.device.type, enabled=False):
+            audio = audio.float()
+            n = self.mel_n_samples
+            audio = audio[:, :n]
+            audio = F.pad(audio, (0, n - audio.size(-1)))
+            stft = torch.stft(
+                audio, self.mel_n_fft, self.mel_hop,
+                window=self.whisper_stft_window, return_complex=True,
+            )
+            magnitudes = stft[..., :-1].abs() ** 2
+            mel = self.whisper_mel_filters.T @ magnitudes
+            log_spec = torch.clamp(mel, min=1e-10).log10()
+            max_val = log_spec.amax(dim=(1, 2), keepdim=True)
+            log_spec = torch.maximum(log_spec, max_val - 8.0)
+            return (log_spec + 4.0) / 4.0
+
     def forward(self, input_values, lang_id=None, max_label_len=None, lengths=None):
         if self.encoder_type == "whisper":
-            features = self.feature_extractor(
-                input_values.cpu().numpy(), sampling_rate=16000,
-                return_tensors="pt",
-            )
-            input_features = features["input_features"].to(input_values.device)
+            input_features = self.whisper_log_mel(input_values)
             with torch.no_grad():
                 encoder_out = self.encoder(
                     input_features,
@@ -344,5 +402,12 @@ class BIOPhonemeTagger(nn.Module):
         offsets = masked_conv(
             self.boundary_offset_head, out.transpose(1, 2), valid
         ).transpose(1, 2)
-        
-        return logits, offsets
+
+        ctc_logits = None
+        if self.ctc_proj is not None:
+            ctc_out = out
+            for layer in self.ctc_layers:
+                ctc_out = layer(ctc_out, valid)
+            ctc_logits = self.ctc_proj(ctc_out).masked_fill(~mask, 0)
+
+        return logits, offsets, ctc_logits

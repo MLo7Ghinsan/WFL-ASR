@@ -8,6 +8,7 @@ data:
   n_mels: 80
 
 model:
+  device: "auto" # "auto", "cpu" or "gpu"
   encoder_type: "whisper"
   whisper_model: "openai/whisper-base"
 
@@ -25,6 +26,9 @@ model:
   dilated_conv_kernel: 3
 
   subframe_loss_weight: 5.0
+
+  ctc_loss_weight: 0.5
+  ctc_conformer_layers: 2
 
   lang_emb_dim: 64
   num_languages: 0
@@ -65,6 +69,7 @@ output:
 postprocess:
   median_filter: 1
   merge_segments: "right"
+  label_mode: "transcribe" # "frame" (per-frame BIO decoding) or "transcribe" (CTC sequence then forced alignment)
   forced_predict_fa: ["SP", "AP"] # these phonemes can be inserted if not in the .txt transcription
   forced_alignment_args:
     self_loop_penalty: -4.6 # penalty for staying on the phoneme
