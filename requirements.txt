@@ -9,6 +9,8 @@ transformers==4.51.3
 click
 pytorch-optimizer
 numba
+pytorch-lightning
+tensorboard
 
 # RECOMMENDED: install torch manually. Environment used: Python 3.11
 #torch==2.6.0+cu124
