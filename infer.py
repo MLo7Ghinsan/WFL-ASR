@@ -740,7 +740,6 @@ def main(
         cfg,
         labels,
         whisper_state=new_state_dict,
-        with_ctc=has_ctc,
     ).to(device)
 
     try:
